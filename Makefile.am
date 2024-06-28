@@ -191,7 +191,6 @@ libredex_la_SOURCES = \
 	libredex/PluginRegistry.cpp \
 	libredex/PointsToSemantics.cpp \
 	libredex/PointsToSemanticsUtils.cpp \
-	libredex/PostLowering.cpp \
 	libredex/PrintSeeds.cpp \
 	libredex/ProguardConfiguration.cpp \
 	libredex/ProguardLexer.cpp \
@@ -287,6 +286,7 @@ libredex_la_SOURCES = \
 	service/escape-analysis/LocalPointersAnalysis.cpp \
 	service/field-ops/FieldOpTracker.cpp \
 	service/init-classes/InitClassPruner.cpp \
+	service/init-deps/InitDeps.cpp \
 	service/kotlin-instance-rewrite/KotlinInstanceRewriter.cpp \
 	service/local-dce/LocalDce.cpp \
 	service/loop-info/LoopInfo.cpp \
@@ -306,6 +306,9 @@ libredex_la_SOURCES = \
 	service/method-inliner/RecursionPruner.cpp \
 	service/method-merger/MethodMerger.cpp \
 	service/method-outliner/OutliningProfileGuidanceImpl.cpp \
+	service/object-sensitive-dce/ObjectSensitiveDce.cpp \
+	service/object-sensitive-dce/SideEffectSummary.cpp \
+	service/object-sensitive-dce/UsedVarsAnalysis.cpp \
 	service/reduce-boolean-branches/ReduceBooleanBranches.cpp \
 	service/reference-update/MethodReference.cpp \
 	service/reference-update/TypeReference.cpp \
@@ -319,6 +322,7 @@ libredex_la_SOURCES = \
 	service/regalloc-fast/LiveInterval.cpp \
 	service/remove_redundant_check_casts/CheckCastAnalysis.cpp \
 	service/remove_redundant_check_casts/CheckCastTransform.cpp \
+	service/resources/RClass.cpp \
 	service/resources/StaticIds.cpp \
 	service/shrinker/Shrinker.cpp \
 	service/switch-dispatch/SwitchDispatch.cpp \
@@ -415,7 +419,6 @@ libopt_la_SOURCES = \
 	opt/interdex/InterDexPass.cpp \
 	opt/interdex/InterDexReshuffleImpl.cpp \
 	opt/interdex/InterDexReshufflePass.cpp \
-	opt/interdex/MAInterDexReshufflePass.cpp \
 	opt/interdex/SortRemainingClassesPass.cpp \
 	opt/kotlin-lambda/RewriteKotlinSingletonInstance.cpp \
 	opt/kotlin-lambda/KotlinObjectInliner.cpp \
@@ -429,8 +432,6 @@ libopt_la_SOURCES = \
 	opt/obfuscate/VirtualRenamer.cpp \
 	opt/obfuscate_resources/ObfuscateResourcesPass.cpp \
 	opt/object-sensitive-dce/ObjectSensitiveDcePass.cpp \
-	opt/object-sensitive-dce/SideEffectSummary.cpp \
-	opt/object-sensitive-dce/UsedVarsAnalysis.cpp \
 	opt/optimize_enums/EnumClinitAnalysis.cpp \
 	opt/optimize_enums/EnumConfig.cpp \
 	opt/optimize_enums/EnumAnalyzeGeneratedMethods.cpp \
@@ -445,7 +446,6 @@ libopt_la_SOURCES = \
 	opt/peephole/Peephole.cpp \
 	opt/peephole/RedundantCheckCastRemover.cpp \
 	opt/print-kotlin-stats/PrintKotlinStats.cpp \
-	opt/print-members/PrintMembers.cpp \
 	opt/reachable-natives/ReachableNatives.cpp \
 	opt/rearrange-enum-clinit/RearrangeEnumClinit.cpp \
 	opt/rebindrefs/ReBindRefs.cpp \
@@ -472,6 +472,7 @@ libopt_la_SOURCES = \
 	opt/resolve-refs/SpecializeRtype.cpp \
 	opt/result-propagation/ResultPropagation.cpp \
 	opt/resolve-proguard-values/ResolveProguardAssumeValues.cpp \
+	opt/resources-inlining-pass/ResourcesInliningPass.cpp \
 	opt/shorten-srcstrings/Shorten.cpp \
 	opt/shrinker/ShrinkerPass.cpp \
 	opt/unreachable/UnreachableLoweringPass.cpp \
@@ -504,7 +505,6 @@ libopt_la_SOURCES = \
 	opt/string_concatenator/StringConcatenator.cpp \
 	opt/stringbuilder-outliner/StringBuilderOutliner.cpp \
 	opt/strip-debug-info/StripDebugInfo.cpp \
-	opt/test_cfg/TestCFG.cpp \
 	opt/optimize_resources/OptimizeResources.cpp \
 	opt/typedef-anno-checker/TypedefAnnoCheckerPass.cpp \
 	opt/type-analysis/CallGraphFileGenerationPass.cpp \

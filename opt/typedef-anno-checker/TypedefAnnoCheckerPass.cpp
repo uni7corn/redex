@@ -8,6 +8,7 @@
 #include "TypedefAnnoCheckerPass.h"
 
 #include "AnnoUtils.h"
+#include "ClassUtil.h"
 #include "PassManager.h"
 #include "Resolver.h"
 #include "Show.h"
@@ -26,9 +27,12 @@ bool is_int(const type_inference::TypeEnvironment& env, reg_t reg) {
   return !env.get_int_type(reg).is_top() && !env.get_int_type(reg).is_bottom();
 }
 
+// if there's no dex type, the value is null, and the checker does not enforce
+// nullability
 bool is_string(const type_inference::TypeEnvironment& env, reg_t reg) {
-  return env.get_dex_type(reg) &&
-         *env.get_dex_type(reg) == type::java_lang_String();
+  return env.get_dex_type(reg) != boost::none
+             ? *env.get_dex_type(reg) == type::java_lang_String()
+             : true;
 }
 
 bool is_not_str_nor_int(const type_inference::TypeEnvironment& env, reg_t reg) {
@@ -55,6 +59,39 @@ bool is_synthetic_kotlin_annotations_method(DexMethod* m) {
                           ANNOTATIONS_SUFFIX);
 }
 
+bool is_lamdda_callback(DexMethod* m) {
+  return m->get_simple_deobfuscated_name() == "invoke" ||
+         m->get_simple_deobfuscated_name() == "onClick";
+}
+
+bool has_kotlin_default_ctor_marker(DexMethod* m) {
+  auto params = m->get_proto()->get_args();
+  if (params->size() > 1 &&
+      params->at(params->size() - 1)->str() ==
+          "Lkotlin/jvm/internal/DefaultConstructorMarker;") {
+    return true;
+  }
+  return false;
+}
+
+DexMethodRef* get_enclosing_method(DexClass* cls) {
+  auto anno_set = cls->get_anno_set();
+  if (!anno_set) {
+    return nullptr;
+  }
+  DexAnnotation* anno = get_annotation(
+      cls, DexType::make_type("Ldalvik/annotation/EnclosingMethod;"));
+  if (anno) {
+    auto& value = anno->anno_elems().begin()->encoded_value;
+    if (value->evtype() == DexEncodedValueTypes::DEVT_METHOD) {
+      auto method_value = static_cast<DexEncodedValueMethod*>(value.get());
+      auto method_name = method_value->show_deobfuscated();
+      return DexMethod::get_method(method_name);
+    }
+  }
+  return nullptr;
+}
+
 // make the methods and fields temporarily synthetic to add annotations
 template <typename DexMember>
 bool add_annotations(DexMember* member, DexAnnotationSet* anno_set) {
@@ -75,12 +112,13 @@ bool add_annotations(DexMember* member, DexAnnotationSet* anno_set) {
   return false;
 }
 
-void collect_from_instruction(
+void collect_param_anno_from_instruction(
     TypeEnvironments& envs,
     type_inference::TypeInference& inference,
     DexMethod* caller,
     IRInstruction* insn,
-    std::vector<std::pair<int, DexAnnotationSet&>>& missing_param_annos) {
+    std::vector<std::pair<src_index_t, DexAnnotationSet&>>& missing_param_annos,
+    bool patch_accessor = true) {
   always_assert(opcode::is_an_invoke(insn->opcode()));
   auto* def_method = resolve_method(caller, insn);
   if (!def_method ||
@@ -103,7 +141,7 @@ void collect_from_instruction(
                             : param_anno.first + 1;
       reg_t param_reg = insn->src(param_index);
       auto anno_type = env.get_annotation(param_reg);
-      if (anno_type && anno_type == annotation) {
+      if (patch_accessor && anno_type && anno_type == annotation) {
         // Safe assignment. Nothing to do.
         continue;
       }
@@ -123,6 +161,31 @@ void collect_from_instruction(
   }
 }
 
+void patch_return_anno_from_get(type_inference::TypeInference& inference,
+                                DexMethod* caller,
+                                IRInstruction* insn) {
+  always_assert(opcode::is_an_iget(insn->opcode()) ||
+                opcode::is_an_sget(insn->opcode()));
+  auto name = caller->get_deobfuscated_name_or_empty();
+  auto pos = name.rfind('$');
+  if (pos == std::string::npos) {
+    return;
+  }
+  pos++;
+  if (!(pos < name.size() && name[pos] >= '0' && name[pos] <= '9')) {
+    return;
+  }
+  auto field_ref = insn->get_field();
+  auto field_anno = type_inference::get_typedef_anno_from_member(
+      field_ref, inference.get_annotations());
+
+  if (field_anno != boost::none) {
+    // Patch missing return annotations from accessed fields
+    caller->attach_annotation_set(std::make_unique<DexAnnotationSet>(
+        *field_ref->as_def()->get_anno_set()));
+  }
+}
+
 } // namespace
 
 void SynthAccessorPatcher::run(const Scope& scope) {
@@ -133,7 +196,502 @@ void SynthAccessorPatcher::run(const Scope& scope) {
     if (is_synthetic_kotlin_annotations_method(m)) {
       patch_kotlin_annotations(m);
     }
+    if (is_constructor(m)) {
+      if (m->get_param_anno()) {
+        patch_synth_cls_fields_from_ctor_param(m);
+      } else {
+        if (has_kotlin_default_ctor_marker(m)) {
+          collect_accessors(m);
+        }
+      }
+    }
+    if (is_lamdda_callback(m) &&
+        klass::maybe_anonymous_class(type_class(m->get_class()))) {
+      patch_local_var_lambda(m);
+    }
   });
+  walk::parallel::classes(scope, [&](DexClass* cls) {
+    if (klass::maybe_anonymous_class(cls) && get_enclosing_method(cls)) {
+      patch_enclosed_method(cls);
+      patch_ctor_params_from_synth_cls_fields(cls);
+    }
+  });
+}
+
+void SynthAccessorPatcher::patch_ctor_params_from_synth_cls_fields(
+    DexClass* cls) {
+  bool has_annotated_fields = false;
+  for (auto field : cls->get_ifields()) {
+    DexAnnotationSet* anno_set = field->get_anno_set();
+    if (anno_set &&
+        type_inference::get_typedef_annotation(
+            anno_set->get_annotations(), m_typedef_annos) != boost::none) {
+      has_annotated_fields = true;
+    }
+  }
+  // if no fields have typedef annotations, there is no need to patch the
+  // constructor
+  if (!has_annotated_fields) {
+    return;
+  }
+
+  for (auto ctor : cls->get_ctors()) {
+    IRCode* ctor_code = ctor->get_code();
+    auto& ctor_cfg = ctor_code->cfg();
+    type_inference::TypeInference ctor_inference(
+        ctor_cfg, /*skip_check_cast_upcasting*/ false, m_typedef_annos,
+        &m_method_override_graph);
+    ctor_inference.run(ctor);
+    TypeEnvironments& ctor_envs = ctor_inference.get_type_environments();
+
+    live_range::MoveAwareChains ctor_chains(ctor_cfg);
+    live_range::DefUseChains ctor_du_chains = ctor_chains.get_def_use_chains();
+    size_t param_idx = 0;
+    for (cfg::Block* b : ctor_cfg.blocks()) {
+      for (auto& mie : InstructionIterable(b)) {
+        auto* insn = mie.insn;
+        if (!opcode::is_a_load_param(insn->opcode())) {
+          continue;
+        }
+        param_idx++;
+        auto param_anno = ctor_envs.at(insn).get_annotation(insn->dest());
+        if (param_anno != boost::none) {
+          continue;
+        }
+        auto& env = ctor_envs.at(insn);
+        if (!is_int(env, insn->dest()) && !is_string(env, insn->dest())) {
+          continue;
+        }
+        auto udchains_it = ctor_du_chains.find(insn);
+        auto uses_set = udchains_it->second;
+        for (live_range::Use use : uses_set) {
+          IRInstruction* use_insn = use.insn;
+          if (!opcode::is_an_iput(use_insn->opcode())) {
+            continue;
+          }
+          auto field = use_insn->get_field()->as_def();
+          if (!field) {
+            continue;
+          }
+          auto field_anno = type_inference::get_typedef_anno_from_member(
+              use_insn->get_field(), ctor_inference.get_annotations());
+          if (field_anno == boost::none) {
+            continue;
+          }
+          DexAnnotationSet anno_set = DexAnnotationSet();
+          anno_set.add_annotation(std::make_unique<DexAnnotation>(
+              DexType::make_type(field_anno.get()->get_name()), DAV_RUNTIME));
+          DexAccessFlags access = ctor->get_access();
+          ctor->set_access(ACC_SYNTHETIC);
+          ctor->attach_param_annotation_set(
+              param_idx - 2, std::make_unique<DexAnnotationSet>(anno_set));
+          ctor->set_access(access);
+        }
+      }
+    }
+  }
+}
+
+// Given a method, named 'callee', inside a lambda and the UseDefChains and
+// TypeInference of the synthetic caller method, check if the callee has
+// annotated parameters. If it does, finds the synthetic field representing the
+// local variable that was passed into the callee and annotate it.
+void annotate_local_var_field_from_callee(
+    const DexMethod* callee,
+    IRInstruction* insn,
+    const live_range::UseDefChains& ud_chains,
+    const type_inference::TypeInference& inference) {
+  if (!callee) {
+    return;
+  }
+  if (!callee->get_param_anno()) {
+    return;
+  }
+  for (auto const& param_anno : *callee->get_param_anno()) {
+    auto annotation = type_inference::get_typedef_annotation(
+        param_anno.second->get_annotations(), inference.get_annotations());
+    if (annotation != boost::none) {
+      live_range::Use use_of_id{insn, (src_index_t)(param_anno.first + 1)};
+      auto udchains_it = ud_chains.find(use_of_id);
+      auto defs_set = udchains_it->second;
+      for (IRInstruction* def : defs_set) {
+        if (!opcode::is_an_iget(def->opcode())) {
+          continue;
+        }
+        auto field = def->get_field()->as_def();
+        if (!field) {
+          continue;
+        }
+        DexAnnotationSet anno_set = DexAnnotationSet();
+        anno_set.add_annotation(std::make_unique<DexAnnotation>(
+            DexType::make_type(annotation.get()->get_name()), DAV_RUNTIME));
+        add_annotations(field, &anno_set);
+      }
+    }
+  }
+}
+
+// Check if the default method calls a method with annotated parameters.
+// If there are annotated parameters, return them, but don't patch them since
+// they'll be patched by collect_accessors
+void SynthAccessorPatcher::collect_annos_from_default_method(
+    DexMethod* method,
+    std::vector<std::pair<src_index_t, DexAnnotationSet&>>&
+        missing_param_annos) {
+  if (!method) {
+    return;
+  }
+  IRCode* code = method->get_code();
+  if (!code) {
+    return;
+  }
+
+  always_assert_log(code->editable_cfg_built(), "%s has no cfg built",
+                    SHOW(method));
+  auto& cfg = code->cfg();
+
+  type_inference::TypeInference inference(cfg, false, m_typedef_annos,
+                                          &m_method_override_graph);
+  inference.run(method);
+  TypeEnvironments& envs = inference.get_type_environments();
+
+  for (cfg::Block* b : cfg.blocks()) {
+    for (auto& mie : InstructionIterable(b)) {
+      auto* insn = mie.insn;
+      IROpcode opcode = insn->opcode();
+      if (opcode::is_an_invoke(opcode)) {
+        collect_param_anno_from_instruction(envs, inference,
+                                            insn->get_method()->as_def(), insn,
+                                            missing_param_annos, false);
+      }
+    }
+  }
+}
+
+// If the method name is invoke or onClick and is part of a synth class, check
+// if it requires annotated fields. If the method calls a default method, check
+// that the default's callee has annotated params. If there are annotated
+// params, annotate the field and its class' constructor's parameters
+void SynthAccessorPatcher::patch_local_var_lambda(DexMethod* method) {
+  IRCode* code = method->get_code();
+  if (!code) {
+    return;
+  }
+
+  always_assert_log(code->editable_cfg_built(), "%s has no cfg built",
+                    SHOW(method));
+  auto& cfg = code->cfg();
+
+  type_inference::TypeInference inference(cfg, false, m_typedef_annos,
+                                          &m_method_override_graph);
+  inference.run(method);
+  live_range::MoveAwareChains chains(cfg);
+  live_range::UseDefChains ud_chains = chains.get_use_def_chains();
+  for (cfg::Block* b : cfg.blocks()) {
+    for (auto& mie : InstructionIterable(b)) {
+      auto* insn = mie.insn;
+
+      // if it's a $default or $access method, get the annotations from its
+      // callee
+      if (opcode::is_invoke_static(insn->opcode())) {
+        DexMethod* static_method = insn->get_method()->as_def();
+        if (!static_method || !is_synthetic_accessor(static_method)) {
+          continue;
+        }
+        std::vector<std::pair<src_index_t, DexAnnotationSet&>>
+            missing_param_annos;
+        collect_annos_from_default_method(static_method, missing_param_annos);
+        // Patch missing param annotations
+        for (auto& pair : missing_param_annos) {
+          DexAnnotationSet anno_set = pair.second;
+          live_range::Use use_of_id{insn, pair.first};
+          auto udchains_it = ud_chains.find(use_of_id);
+          auto defs_set = udchains_it->second;
+          for (IRInstruction* def : defs_set) {
+            if (!opcode::is_an_iget(def->opcode())) {
+              continue;
+            }
+            auto field = def->get_field()->as_def();
+            if (!field) {
+              continue;
+            }
+            add_annotations(field, &anno_set);
+          }
+        }
+      } else if (opcode::is_invoke_interface(insn->opcode())) {
+        auto* callee_def = resolve_method(method, insn);
+        auto callees =
+            mog::get_overriding_methods(m_method_override_graph, callee_def);
+        for (auto callee : callees) {
+          annotate_local_var_field_from_callee(callee, insn, ud_chains,
+                                               inference);
+        }
+      } else if (opcode::is_an_invoke(insn->opcode())) {
+        const DexMethod* callee = insn->get_method()->as_def();
+        annotate_local_var_field_from_callee(callee, insn, ud_chains,
+                                             inference);
+      }
+    }
+  }
+}
+
+// Given a constructor of a synthetic class, check if it has typedef annotated
+// parameters. If it does, find the field that the parameter got put into and
+// annotate it.
+void SynthAccessorPatcher::patch_synth_cls_fields_from_ctor_param(
+    DexMethod* ctor) {
+  IRCode* code = ctor->get_code();
+  if (!code) {
+    return;
+  }
+  always_assert_log(code->editable_cfg_built(), "%s has no cfg built",
+                    SHOW(ctor));
+  auto& cfg = code->cfg();
+
+  type_inference::TypeInference inference(cfg, false, m_typedef_annos,
+                                          &m_method_override_graph);
+  inference.run(ctor);
+  TypeEnvironments& envs = inference.get_type_environments();
+  auto class_name_dot = ctor->get_class()->get_name()->str() + ".";
+
+  for (cfg::Block* b : cfg.blocks()) {
+    for (auto& mie : InstructionIterable(b)) {
+      auto* insn = mie.insn;
+      if (!opcode::is_an_iput(insn->opcode())) {
+        continue;
+      }
+      DexField* field = insn->get_field()->as_def();
+      if (!field) {
+        continue;
+      }
+      auto& env = envs.at(insn);
+      if (!is_int(env, insn->src(0)) && !is_string(env, insn->src(0))) {
+        continue;
+      }
+      auto annotation = env.get_annotation(insn->src(0));
+      if (annotation != boost::none) {
+        DexAnnotationSet anno_set = DexAnnotationSet();
+        anno_set.add_annotation(std::make_unique<DexAnnotation>(
+            DexType::make_type(annotation.get()->get_name()), DAV_RUNTIME));
+        add_annotations(field, &anno_set);
+        auto field_name = field->get_simple_deobfuscated_name();
+        field_name.at(0) = std::toupper(field_name.at(0));
+        const auto int_or_string =
+            type::is_int(field->get_type())
+                ? "I"
+                : type::java_lang_String()->get_name()->str();
+        // add annotations to the Kotlin getter and setter methods
+        add_annotations(
+            DexMethod::get_method(class_name_dot + "get" + field_name + ":()" +
+                                  int_or_string),
+            &anno_set);
+        add_annotations(
+            DexMethod::get_method(class_name_dot + "set" + field_name + ":(" +
+                                  int_or_string + ")V"),
+            &anno_set);
+      }
+    }
+  }
+}
+
+void SynthAccessorPatcher::patch_enclosed_method(DexClass* cls) {
+  auto cls_name = cls->get_deobfuscated_name_or_empty_copy();
+  auto first_dollar = cls_name.find('$');
+  always_assert_log(first_dollar != std::string::npos,
+                    "The enclosed method class %s should have a $ in the name",
+                    SHOW(cls));
+  auto original_cls_name = cls_name.substr(0, first_dollar) + ";";
+  DexClass* original_class =
+      type_class(DexType::make_type(DexString::make_string(original_cls_name)));
+  if (!original_class) {
+    return;
+  }
+
+  auto second_dollar = cls_name.find('$', first_dollar + 1);
+  auto fields = m_lambda_anno_map.get(cls_name.substr(0, second_dollar));
+  if (!fields) {
+    return;
+  }
+
+  for (auto field : *fields) {
+    auto field_name = cls_name + "." + field->get_simple_deobfuscated_name() +
+                      ":" + field->get_type()->str_copy();
+    DexFieldRef* field_ref = DexField::get_field(field_name);
+    if (field_ref && field->get_deobfuscated_name() != field_name) {
+      DexAnnotationSet a_set = DexAnnotationSet();
+      a_set.combine_with(*field->get_anno_set());
+      DexField* dex_field = field_ref->as_def();
+      if (dex_field) {
+        add_annotations(dex_field, &a_set);
+      }
+    }
+  }
+}
+
+void SynthAccessorPatcher::patch_first_level_nested_lambda(DexClass* cls) {
+  auto enclosing_method = get_enclosing_method(cls);
+  // if the class is not enclosed, there is no annotation to derive
+  if (!enclosing_method) {
+    return;
+  }
+  // if the parent class is anonymous or not a def, there is no annotation to
+  // derive. If an annotation is needed, it will be propagated later in
+  // patch_enclosed_method
+  const auto parent_class = type_class(enclosing_method->get_class());
+  if (klass::maybe_anonymous_class(parent_class) ||
+      !enclosing_method->is_def()) {
+    return;
+  }
+  // In Java, the common class name is everything before the first $,
+  // and there is no second $ in the class name. For example, from the
+  // tests, the method name is
+  // Lcom/facebook/redextest/TypedefAnnoCheckerTest$2;.override_method:()V
+  //
+  // In kotlin, the common class name is everything before the second $
+  // From the tests, the method name is
+  // Lcom/facebook/redextest/TypedefAnnoCheckerKtTest$testLambdaCall$1;.invoke:()Ljava/lang/String;
+  auto cls_name = cls->get_deobfuscated_name_or_empty_copy();
+  auto common_class_name_end = cls_name.find('$') + 1;
+  if (cls_name[common_class_name_end] < '0' ||
+      cls_name[common_class_name_end] > '9') {
+    common_class_name_end = cls_name.find('$', cls_name.find('$') + 1);
+  }
+  if (common_class_name_end == std::string::npos) {
+    return;
+  }
+  // if the map is already filled in, there's nothing to do.
+  // class_prefix is the entire class name before the second dollar sign
+  auto class_prefix = cls_name.substr(0, common_class_name_end);
+  if (m_lambda_anno_map.get(cls_name.substr(0, common_class_name_end))) {
+    return;
+  }
+
+  DexMethod* method = enclosing_method->as_def();
+  IRCode* code = method->get_code();
+  if (!code) {
+    return;
+  }
+
+  always_assert_log(code->editable_cfg_built(), "%s has no cfg built",
+                    SHOW(method));
+  auto& cfg = code->cfg();
+  if (!method->get_param_anno()) {
+    // Method does not pass in any typedef values to synthetic constructor.
+    // Nothing to do.
+    // TODO: if a method calls the synthetic constructor with an annotated value
+    // from another method's return, the annotation can be derived and should be
+    // patched
+    return;
+  }
+
+  type_inference::TypeInference inference(cfg, false, m_typedef_annos,
+                                          &m_method_override_graph);
+
+  bool has_typedef_annotated_params = false;
+  for (auto const& param_anno : *method->get_param_anno()) {
+    auto annotation = type_inference::get_typedef_annotation(
+        param_anno.second->get_annotations(), inference.get_annotations());
+    if (annotation != boost::none) {
+      has_typedef_annotated_params = true;
+    }
+  }
+  if (!has_typedef_annotated_params) {
+    return;
+  }
+
+  // If the original method calls a synthetic constructor with typedef params,
+  // add the correct annotations to the params, so we can find the correct
+  // synthetic fields that need to be patched
+  inference.run(method);
+  TypeEnvironments& envs = inference.get_type_environments();
+  bool patched_params = false;
+  for (cfg::Block* b : cfg.blocks()) {
+    for (auto& mie : InstructionIterable(b)) {
+      auto* insn = mie.insn;
+      if (insn->opcode() != OPCODE_INVOKE_DIRECT) {
+        continue;
+      }
+      // if the method invoked is not a constructor of the synthetic class
+      // we're currently analyzing, skip it
+      DexMethod* method_def = insn->get_method()->as_def();
+      if (!method_def || !is_constructor(method_def) ||
+          method_def->get_class()->get_name() != cls->get_name()) {
+        continue;
+      }
+      // patch the constructor's parameters
+      size_t total_args = method_def->get_proto()->get_args()->size();
+      size_t src_idx = 1;
+      while (src_idx <= total_args) {
+        auto param_anno = envs.at(insn).get_annotation(insn->src(src_idx));
+        if (param_anno != boost::none) {
+          auto anno_set = DexAnnotationSet();
+          anno_set.add_annotation(std::make_unique<DexAnnotation>(
+              DexType::make_type(param_anno.get()->get_name()),
+              DexAnnotationVisibility::DAV_RUNTIME));
+          DexAccessFlags access = method_def->get_access();
+          method_def->set_access(ACC_SYNTHETIC);
+          method_def->attach_param_annotation_set(
+              src_idx - 1, std::make_unique<DexAnnotationSet>(anno_set));
+          method_def->set_access(access);
+          patched_params = true;
+        }
+        src_idx += 1;
+      }
+    }
+  }
+  if (!patched_params) {
+    return;
+  }
+
+  // Patch the field and store it in annotated_fields so any synthetic
+  // classes that are derived from the current one don't need to traverse
+  // up to the non-synthetic class to get the typedef annotation.
+  // Further derived classes will have the same prefix class name and field
+  // that needs to be annotated
+  std::vector<const DexField*> annotated_fields;
+  for (auto ctor : cls->get_ctors()) {
+    IRCode* ctor_code = ctor->get_code();
+    auto& ctor_cfg = ctor_code->cfg();
+    type_inference::TypeInference ctor_inference(
+        ctor_cfg, false, m_typedef_annos, &m_method_override_graph);
+    ctor_inference.run(ctor);
+    TypeEnvironments& ctor_envs = ctor_inference.get_type_environments();
+
+    live_range::MoveAwareChains chains(ctor_cfg);
+    live_range::UseDefChains ud_chains = chains.get_use_def_chains();
+    for (cfg::Block* b : ctor_cfg.blocks()) {
+      for (auto& mie : InstructionIterable(b)) {
+        auto* insn = mie.insn;
+        if (!opcode::is_an_iput(insn->opcode())) {
+          continue;
+        }
+        auto& env = ctor_envs.at(insn);
+        if (!is_int(env, insn->src(0)) && !is_string(env, insn->src(0))) {
+          continue;
+        }
+        auto field = insn->get_field()->as_def();
+        if (!field) {
+          continue;
+        }
+
+        live_range::Use use_of_id{insn, 0};
+        auto udchains_it = ud_chains.find(use_of_id);
+        auto defs_set = udchains_it->second;
+        for (IRInstruction* def : defs_set) {
+          auto param_anno = env.get_annotation(def->dest());
+          if (param_anno != boost::none) {
+            DexAnnotationSet anno_set = DexAnnotationSet();
+            anno_set.add_annotation(std::make_unique<DexAnnotation>(
+                DexType::make_type(param_anno.get()->get_name()), DAV_RUNTIME));
+            add_annotations(field, &anno_set);
+            annotated_fields.push_back(field);
+          }
+        }
+      }
+    }
+  }
+
+  m_lambda_anno_map.emplace(class_prefix, annotated_fields);
 }
 
 void SynthAccessorPatcher::patch_kotlin_annotations(DexMethod* m) {
@@ -185,6 +743,7 @@ void SynthAccessorPatcher::patch_kotlin_annotations(DexMethod* m) {
   // getters:
   //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest$Companion.getField_one:()I
   //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest;.access$getField_one$cp:()I
+  //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest;.access$getField_one$p:()I
   // setters:
   //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest$Companion.setField_one:(I)
   //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest;.access$setField_one$cp:(I)V
@@ -193,9 +752,14 @@ void SynthAccessorPatcher::patch_kotlin_annotations(DexMethod* m) {
   //    Lcom/facebook/redextest/TypedefAnnoCheckerKtTest;.field_one:I
 
   // some synthetic interfaces' names have $-CC. Delete it from the name
-  auto class_name = m->get_class()->get_name()->str() + ".";
+  auto original_class_name = m->get_class()->get_name()->str();
+  auto class_name = original_class_name + ".";
   auto pos = class_name.find("$-CC");
   if (pos != std::string::npos) class_name.erase(pos, 4);
+  auto companion_pos = class_name.find(COMPANION_CLASS);
+  auto base_class_name = (companion_pos != std::string::npos)
+                             ? class_name.substr(0, companion_pos) + ";."
+                             : class_name;
 
   auto anno_method_name = m->get_simple_deobfuscated_name();
   auto method_name =
@@ -216,26 +780,27 @@ void SynthAccessorPatcher::patch_kotlin_annotations(DexMethod* m) {
                                         int_or_string + ")V"),
                   anno_set);
 
-  auto companion_pos = class_name.find(COMPANION_CLASS);
-  if (companion_pos != std::string::npos) {
-    class_name = class_name.substr(0, companion_pos) + ";.";
-    // add annotations to access non-companion getter and setter methods
-    add_annotations(
-        DexMethod::get_method(class_name + ACCESS_PREFIX + "get" + field_name +
-                              "$cp:()" + int_or_string),
-        anno_set);
-    add_annotations(
-        DexMethod::get_method(class_name + ACCESS_PREFIX + "set" + field_name +
-                              "$cp:(" + int_or_string + ")V"),
-        anno_set);
-  }
+  // add annotations to access non-companion getter and setter methods
+  add_annotations(
+      DexMethod::get_method(base_class_name + ACCESS_PREFIX + "get" +
+                            field_name + "$cp:()" + int_or_string),
+      anno_set);
+  add_annotations(
+      DexMethod::get_method(base_class_name + ACCESS_PREFIX + "set" +
+                            field_name + "$cp:(" + int_or_string + ")V"),
+      anno_set);
+  add_annotations(DexMethod::get_method(
+                      base_class_name + ACCESS_PREFIX + "get" + field_name +
+                      "$p:(" + original_class_name + ")" + int_or_string),
+                  anno_set);
+
   // add annotations to field
-  if (!add_annotations(
-          DexField::get_field(class_name + field_name + ":" + int_or_string),
-          anno_set)) {
+  if (!add_annotations(DexField::get_field(base_class_name + field_name + ":" +
+                                           int_or_string),
+                       anno_set)) {
     field_name.at(0) = std::tolower(field_name.at(0));
     add_annotations(
-        DexField::get_field(class_name + field_name + ":" + int_or_string),
+        DexField::get_field(base_class_name + field_name + ":" + int_or_string),
         anno_set);
   }
 }
@@ -253,22 +818,29 @@ void SynthAccessorPatcher::collect_accessors(DexMethod* m) {
   inference.run(m);
 
   TypeEnvironments& envs = inference.get_type_environments();
-  std::vector<std::pair<int, DexAnnotationSet&>> missing_param_annos;
+  std::vector<std::pair<src_index_t, DexAnnotationSet&>> missing_param_annos;
   for (cfg::Block* b : cfg.blocks()) {
     for (auto& mie : InstructionIterable(b)) {
       auto* insn = mie.insn;
       IROpcode opcode = insn->opcode();
-      if (!opcode::is_an_invoke(opcode)) {
-        continue;
+      if (opcode::is_an_invoke(opcode)) {
+        collect_param_anno_from_instruction(envs, inference, m, insn,
+                                            missing_param_annos);
+      } else if (opcode::is_an_iget(opcode) || opcode::is_an_sget(opcode)) {
+        patch_return_anno_from_get(inference, m, insn);
       }
-      collect_from_instruction(envs, inference, m, insn, missing_param_annos);
     }
   }
 
   // Patch missing param annotations
   for (auto& pair : missing_param_annos) {
     int param_index = pair.first;
-    always_assert(is_static(m));
+    if (is_synthetic_accessor(m)) {
+      always_assert(is_static(m));
+    } else {
+      always_assert(is_constructor(m));
+      param_index -= 1;
+    }
     m->attach_param_annotation_set(
         param_index, std::make_unique<DexAnnotationSet>(pair.second));
     TRACE(TAC, 2, "Add param annotation %s at %d to %s", SHOW(&pair.second),
@@ -317,7 +889,7 @@ void TypedefAnnoChecker::run(DexMethod* m) {
 
 void TypedefAnnoChecker::check_instruction(
     DexMethod* m,
-    type_inference::TypeInference* inference,
+    const type_inference::TypeInference* inference,
     IRInstruction* insn,
     const boost::optional<const DexType*>& return_annotation,
     live_range::UseDefChains* ud_chains,
@@ -414,6 +986,8 @@ void TypedefAnnoChecker::check_instruction(
   }
   // when writing to annotated fields, check that the value is annotated
   case OPCODE_IPUT:
+  case OPCODE_SPUT:
+  case OPCODE_SPUT_OBJECT:
   case OPCODE_IPUT_OBJECT: {
     auto env_anno = env.get_annotation(insn->src(0));
     auto field_anno = type_inference::get_typedef_anno_from_member(
@@ -495,7 +1069,7 @@ bool TypedefAnnoChecker::check_typedef_value(
     live_range::UseDefChains* ud_chains,
     IRInstruction* insn,
     const src_index_t src,
-    type_inference::TypeInference* inference,
+    const type_inference::TypeInference* inference,
     TypeEnvironments& envs) {
 
   auto anno_class = type_class(annotation.value());
@@ -542,6 +1116,19 @@ bool TypedefAnnoChecker::check_typedef_value(
         break;
       }
       if (int_value_set->count(const_value) == 0) {
+        // when passing an integer to a default method, the value will be 0 if
+        // the default method will the default value. The const 0 is not
+        // annotated and might not be in the IntDef. Since the checker will
+        // check that the default value is a member of the IntDef, passing in 0
+        // is safe. Example caller and default methods: P1222824190 P1222829651
+        if (const_value == 0 && opcode::is_an_invoke(insn->opcode())) {
+          DexMethodRef* callee = insn->get_method();
+          if (callee->is_def() &&
+              boost::ends_with(callee->as_def()->get_simple_deobfuscated_name(),
+                               DEFAULT_SUFFIX)) {
+            break;
+          }
+        }
         std::ostringstream out;
         out << "TypedefAnnoCheckerPass: in method " << show(m)
             << "\n the int value " << show(const_value)
@@ -620,6 +1207,13 @@ bool TypedefAnnoChecker::check_typedef_value(
             type_inference::get_typedef_anno_from_member(
                 callee, inference->get_annotations());
         if (anno == boost::none || anno != annotation) {
+          DexType* return_type = callee->get_proto()->get_rtype();
+          // constant folding might cause the source to be the invoked boolean
+          // method https://fburl.com/code/h3dn0ft0
+          if (type::is_boolean(return_type) && int_value_set->count(0) == 1 &&
+              int_value_set->count(1) == 1) {
+            break;
+          }
           std::ostringstream out;
           out << "TypedefAnnoCheckerPass: the method "
               << show(def->get_method()->as_def())
@@ -656,7 +1250,9 @@ bool TypedefAnnoChecker::check_typedef_value(
       break;
     }
     case OPCODE_IGET:
-    case OPCODE_IGET_OBJECT: {
+    case OPCODE_SGET:
+    case OPCODE_IGET_OBJECT:
+    case OPCODE_SGET_OBJECT: {
       auto field_anno = type_inference::get_typedef_anno_from_member(
           def->get_field(), inference->get_annotations());
       if (!field_anno || field_anno != annotation) {
@@ -696,11 +1292,18 @@ void TypedefAnnoCheckerPass::run_pass(DexStoresVector& stores,
   auto method_override_graph = mog::build_graph(scope);
   StrDefConstants strdef_constants;
   IntDefConstants intdef_constants;
+  SynthAccessorPatcher patcher(m_config, *method_override_graph);
   walk::parallel::classes(scope, [&](DexClass* cls) {
     gather_typedef_values(cls, strdef_constants, intdef_constants);
+
+    // to reduce the number of walk::parallel::classes necessary,
+    // run the first level nested lambda patcher here instead of
+    // having a dedicated run along inside patcher.run
+    if (klass::maybe_anonymous_class(cls)) {
+      patcher.patch_first_level_nested_lambda(cls);
+    }
   });
 
-  SynthAccessorPatcher patcher(m_config, *method_override_graph);
   patcher.run(scope);
   TRACE(TAC, 2, "Finish patching synth accessors");
 

@@ -16,6 +16,16 @@ interface I {
   int get();
 }
 
+class AccessGetClass {
+	@TestIntDef public static int public_field = 0;
+
+  public void takes_param(@TestIntDef int val) {
+    public_field = val;
+  }
+
+	public void override_method() {}
+}
+
 abstract class AbstractClass{
   abstract @TestIntDef int pureVirtual(@TestIntDef int val);
 
@@ -84,6 +94,7 @@ class NoAnnoVirtualTest extends AbstractClass{
 public class TypedefAnnoCheckerTest {
 
   @TestIntDef int int_field = TestIntDef.ZERO;
+  @TestIntDef private static int static_int_field = TestIntDef.ZERO;
   @TestStringDef int wrong_anno_field;
   @TestStringDef String str_field;
   int no_anno_field = 6;
@@ -136,7 +147,7 @@ public class TypedefAnnoCheckerTest {
     return int_field;
   }
 
-void testWrongIntField(@TestIntDef int val) {
+  void testWrongIntField(@TestIntDef int val) {
     wrong_anno_field = val;
   }
 
@@ -299,4 +310,41 @@ void testWrongIntField(@TestIntDef int val) {
   static @TestStringDef String testAssignNullToString() {
     return null;
   }
+
+  static boolean getBoolean() {
+    return true;
+  }
+
+  static @TestIntDef int testConstFolding() {
+    @TestIntDef int val = getBoolean() ? TestIntDef.ONE : TestIntDef.ZERO;
+    return val;
+  }
+
+  @TestIntDef int testSGet() {
+    @TestIntDef int val = static_int_field;
+    return val;
+  }
+
+  public AccessGetClass testAccessGet() {
+  	return new AccessGetClass() {
+    	@Override
+      public void override_method() {
+        takes_param(static_int_field);
+      }
+    };
+  }
+
+  public AccessGetClass testSyntheticValField(@TestIntDef int param) {
+  	return new AccessGetClass() {
+      @Override
+      public void override_method() {
+        takes_param(param);
+      }
+    };
+  }
+
+  @TestStringDef public String testNullString() {
+    return null;
+  }
+
 }

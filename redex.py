@@ -290,9 +290,6 @@ def run_redex_binary(
     if state.args.is_art_build:
         args += ["--is-art-build"]
 
-    if state.args.post_lowering:
-        args += ["--post-lowering"]
-
     if state.args.disable_dex_hasher:
         args += ["--disable-dex-hasher"]
 
@@ -693,12 +690,6 @@ Given an APK, produce a better APK!
         help="States that this is an art only build",
     )
     parser.add_argument(
-        "--post-lowering",
-        action="store_true",
-        default=False,
-        help="Specifies whether post lowering processing should be done",
-    )
-    parser.add_argument(
         "--disable-dex-hasher", action="store_true", help="Disable DexHasher"
     )
     parser.add_argument(
@@ -798,6 +789,13 @@ Given an APK, produce a better APK!
         "--verify-dexes", type=str, help="Verify dex files with the supplied command"
     )
 
+    parser.add_argument(
+        "--deep-data-enabled-interactions",
+        default=None,
+        nargs="+",
+        help="Override deep data enabled interactions",
+    )
+
     # Manual tool paths.
 
     # Must be subclassed.
@@ -844,6 +842,10 @@ Given an APK, produce a better APK!
 
     parser.add_argument("--trace", type=str)
     parser.add_argument("--trace-file", type=str)
+    # Relevant options to TraceClassAfterEachPass
+    parser.add_argument("--trace-class-name", type=str)
+    parser.add_argument("--trace-method-name", type=str)
+    parser.add_argument("--after-pass-trace-file", type=str)
 
     return parser
 
@@ -989,19 +991,30 @@ def _check_android_sdk_api(args: argparse.Namespace) -> None:
         LOGGER.warning("No embedded files, please add manually!")
 
 
-def _handle_profiles(args: argparse.Namespace) -> None:
+def _handle_profiles(
+    args: argparse.Namespace, dd_enabled_interactions: typing.List[str]
+) -> None:
     if not args.packed_profiles:
         return
 
     directory = make_temp_dir(".redex_profiles", False)
     unpack_tar_xz(args.packed_profiles, directory)
 
-    # Create input for method profiles.
-    method_profiles_str = ", ".join(
+    method_profiles_paths = (
         f'"{f.path}"'
         for f in os.scandir(directory)
         if f.is_file() and ("method_stats" in f.name or "agg_stats" in f.name)
     )
+
+    if len(dd_enabled_interactions) > 0:
+        method_profiles_paths = [
+            mpp
+            for mpp in method_profiles_paths
+            if any([f"_{i}_" in mpp for i in dd_enabled_interactions])
+        ]
+
+    # Create input for method profiles.
+    method_profiles_str = ", ".join(method_profiles_paths)
     if method_profiles_str:
         LOGGER.debug("Found method profiles: %s", method_profiles_str)
         args.passthru_json.append(f"agg_method_stats_files=[{method_profiles_str}]")
@@ -1009,13 +1022,22 @@ def _handle_profiles(args: argparse.Namespace) -> None:
         LOGGER.info("No method profiles found in %s", args.packed_profiles)
 
     # Create input for basic blocks.
-    # Note: at the moment, only look for ColdStart.
-    join_str = ";" if IS_WINDOWS else ":"
-    block_profiles_str = join_str.join(
+
+    block_profiles_paths = (
         f"{f.path}"
         for f in os.scandir(directory)
         if f.is_file() and f.name.startswith("block_profiles_")
     )
+
+    if len(dd_enabled_interactions) > 0:
+        block_profiles_paths = [
+            bpp
+            for bpp in block_profiles_paths
+            if any([f"_{i}_" in bpp for i in dd_enabled_interactions])
+        ]
+
+    join_str = ";" if IS_WINDOWS else ":"
+    block_profiles_str = join_str.join(block_profiles_paths)
     if block_profiles_str:
         LOGGER.debug("Found block profiles: %s", block_profiles_str)
         # Assume there's at most one.
@@ -1182,7 +1204,13 @@ def prepare_redex(args: argparse.Namespace) -> State:
                 sys.exit()
 
         # Unpack profiles, if they exist.
-        _handle_profiles(args)
+        dd_enabled_interactions = (
+            args.deep_data_enabled_interactions
+            if args.deep_data_enabled_interactions
+            else config_dict.get("deep_data_enabled_interactions", [])
+        )
+
+        _handle_profiles(args, dd_enabled_interactions)
         _handle_secondary_method_profiles(args)
 
         LOGGER.debug("Moving contents to expected structure...")
@@ -1494,6 +1522,12 @@ def early_apply_args(args: argparse.Namespace) -> None:
 
     if args.trace_file:
         os.environ["TRACEFILE"] = args.trace_file
+    if args.after_pass_trace_file:
+        os.environ["TRACE_CLASS_FILE"] = args.after_pass_trace_file
+    if args.trace_class_name:
+        os.environ["TRACE_CLASS_NAME"] = args.trace_class_name
+    if args.trace_method_name:
+        os.environ["TRACE_METHOD_NAME"] = args.trace_method_name
 
 
 if __name__ == "__main__":

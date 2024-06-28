@@ -10,13 +10,16 @@ package com.facebook.redextest
 import integ.TestIntDef
 import integ.TestStringDef
 
-annotation class NotSafeAnno {}
+public class ClassWithParams(@TestIntDef var int_field: Int) {}
+
+public class ClassWithDefaultParams(@TestIntDef var int_field: Int = TestIntDef.THREE) {}
 
 public class TypedefAnnoCheckerKtTest {
 
   @TestStringDef val field_str: String = TestStringDef.TWO
   @TestStringDef var var_field: String = TestStringDef.THREE
   @NotSafeAnno val field_not_safe: String = "4"
+  @TestIntDef var field_int: Int = TestIntDef.ONE
 
   companion object {
     @TestStringDef val companion_val: String = TestStringDef.ONE
@@ -100,5 +103,59 @@ public class TypedefAnnoCheckerKtTest {
       "4" -> 4
       else -> 0
     }
+  }
+
+  @TestStringDef
+  fun call_lambda(lambda_func: () -> String): String {
+    return lambda_func()
+  }
+
+  fun assign_and_print(@TestStringDef param: String) {
+    var_field = param
+    print(param)
+  }
+
+  fun assign_and_print_default(@TestStringDef param: String, def_param: String = "hello") {
+    print(param)
+    print(def_param)
+  }
+
+  @TestStringDef
+  fun testLambdaCall(@TestStringDef param: String): String {
+    return call_lambda({
+      var_field = param
+      assign_and_print(param)
+      param
+    })
+  }
+
+  @TestIntDef
+  fun testClassConstructorArgs(@TestIntDef param: Int): Int {
+    val ctor_test: ClassWithParams = ClassWithParams(param)
+    return ctor_test.int_field
+  }
+
+  @TestIntDef
+  fun testClassConstructorDefaultArgs(@TestIntDef param: Int): Int {
+    val default_ctor_test: ClassWithDefaultParams = ClassWithDefaultParams(param)
+    return default_ctor_test.int_field
+  }
+
+  @TestStringDef
+  fun testLambdaCallLocalVar(): String {
+    val local_val = "two"
+    return call_lambda({
+      assign_and_print_default(local_val)
+      local_val
+    })
+  }
+
+  @TestStringDef
+  fun testLambdaCallLocalVarInvalid(): String {
+    val local_val = "randomval"
+    return call_lambda({
+      assign_and_print_default(local_val)
+      local_val
+    })
   }
 }

@@ -115,7 +115,6 @@ class DexType;
   TM(PEEPHOLE)          \
   TM(PGR)               \
   TM(PM)                \
-  TM(POST_LOWERING)     \
   TM(PPP)               \
   TM(PTA)               \
   TM(PURITY)            \
@@ -132,6 +131,7 @@ class DexType;
   TM(RES)               \
   TM(RESO)              \
   TM(RG)                \
+  TM(RIP)               \
   TM(RME)               \
   TM(RMGOTO)            \
   TM(RM_INTF)           \

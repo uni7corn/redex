@@ -116,12 +116,14 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/service/escape-analysis \
 	-I$(top_srcdir)/service/field-ops \
 	-I$(top_srcdir)/service/init-classes \
+	-I$(top_srcdir)/service/init-deps \
 	-I$(top_srcdir)/service/local-dce \
 	-I$(top_srcdir)/service/loop-info \
 	-I$(top_srcdir)/service/method-dedup \
 	-I$(top_srcdir)/service/method-inliner \
 	-I$(top_srcdir)/service/method-outliner \
 	-I$(top_srcdir)/service/method-merger \
+	-I$(top_srcdir)/service/object-sensitive-dce \
 	-I$(top_srcdir)/service/kotlin-instance-rewrite \
 	-I$(top_srcdir)/service/reduce-boolean-branches \
 	-I$(top_srcdir)/service/reference-update \
