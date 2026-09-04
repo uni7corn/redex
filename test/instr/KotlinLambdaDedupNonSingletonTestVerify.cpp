@@ -5,11 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "Debug.h"
 #include "verify/VerifyUtil.h"
 
 #include <algorithm>
 #include <initializer_list>
-#include <ranges>
 #include <string_view>
 
 #include <gmock/gmock.h>

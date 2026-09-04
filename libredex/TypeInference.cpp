@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "AnnoUtils.h"
+#include "Debug.h"
 #include "Show.h"
 #include "Trace.h"
 #include "TypeUtil.h"
@@ -775,24 +776,28 @@ void TypeInference::analyze_instruction(const IRInstruction* insn,
     break;
   }
   case OPCODE_CONST_STRING: {
-    set_reference(current_state, RESULT_REGISTER, type::java_lang_String());
+    // Either we get the interned string or the instruction throws, so the
+    // result is never null. java.lang.String is final, so the type is exact.
+    set_reference(current_state, RESULT_REGISTER, type::java_lang_String(),
+                  /* is_not_null */ true);
     break;
   }
   case OPCODE_CONST_CLASS: {
-    set_reference(current_state, RESULT_REGISTER, type::java_lang_Class());
+    // Same as const-string: either we get the class object or the instruction
+    // throws, and java.lang.Class is final.
+    set_reference(current_state, RESULT_REGISTER, type::java_lang_Class(),
+                  /* is_not_null */ true);
     break;
   }
   case OPCODE_CONST_METHOD_HANDLE: {
     always_assert_log(false,
                       "TypeInference::analyze_instruction does not support "
                       "const-method-handle yet");
-    break;
   }
   case OPCODE_CONST_METHOD_TYPE: {
     always_assert_log(false,
                       "TypeInference::analyze_instruction does not support "
                       "const-method-type yet");
-    break;
   }
   case OPCODE_MONITOR_ENTER:
   case OPCODE_MONITOR_EXIT: {
@@ -1205,7 +1210,6 @@ void TypeInference::analyze_instruction(const IRInstruction* insn,
     not_reached_log(
         "TypeInference::analyze_instruction does not support "
         "invoke-custom yet");
-    break;
   }
   case OPCODE_INVOKE_POLYMORPHIC:
   case OPCODE_INVOKE_VIRTUAL:

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "InitClassesWithSideEffects.h"
@@ -166,9 +167,6 @@ void InterDexPass::run_pass(
     const ReserveRefsInfo& refs_info,
     ClassReferencesCache& cache) {
   mgr.set_metric(METRIC_LINEAR_ALLOC_LIMIT, m_linear_alloc_limit);
-  mgr.set_metric(METRIC_RESERVED_FREFS, refs_info.frefs);
-  mgr.set_metric(METRIC_RESERVED_TREFS, refs_info.trefs);
-  mgr.set_metric(METRIC_RESERVED_MREFS, refs_info.mrefs);
   mgr.set_metric(METRIC_EMIT_CANARIES, static_cast<int64_t>(m_emit_canaries));
   mgr.set_metric(METRIC_ORDER_INTERDEX, static_cast<int64_t>(m_order_interdex));
 
@@ -366,14 +364,45 @@ void InterDexPass::run_pass(DexStoresVector& stores,
   ReserveRefsInfo refs_info = m_reserve_refs;
   refs_info += mgr.get_reserved_refs();
 
+  // Plugins only run on the root store, so their reservations would be dead
+  // weight in every other store's dexes.
+  ReserveRefsInfo root_refs_info = refs_info;
+  for (const auto& plugin : plugins) {
+    root_refs_info += plugin->get_reserve_refs();
+  }
+
+  // Publish refs_info, not root_refs_info: passes after InterDex read these as
+  // headroom that is still free in every dex, and the plugin share is not. The
+  // plugins' cleanup() spends it -- as real methods and types in the emitted
+  // dexes -- before InterDex returns, so advertising it would make those refs
+  // count twice against a downstream pass's budget.
+  mgr.set_metric(METRIC_RESERVED_FREFS, refs_info.frefs);
+  mgr.set_metric(METRIC_RESERVED_TREFS, refs_info.trefs);
+  mgr.set_metric(METRIC_RESERVED_MREFS, refs_info.mrefs);
+  mgr.set_metric(METRIC_PLUGIN_RESERVED_FREFS,
+                 root_refs_info.frefs - refs_info.frefs);
+  mgr.set_metric(METRIC_PLUGIN_RESERVED_TREFS,
+                 root_refs_info.trefs - refs_info.trefs);
+  mgr.set_metric(METRIC_PLUGIN_RESERVED_MREFS,
+                 root_refs_info.mrefs - refs_info.mrefs);
+
   ClassReferencesCache cache(original_scope);
 
-  std::vector<DexStore*> parallel_stores;
+  // `run_pass` on the root store reaches `treat_generated_stores`, which
+  // erases from `stores`; walking the vector across that erase would leave the
+  // loop running against an invalidated end iterator.
   for (auto& store : stores) {
     if (store.is_root_store()) {
       run_pass(original_scope, xstore_refs, init_classes_with_side_effects,
-               stores, store.get_dexen(), plugins, conf, mgr, refs_info, cache);
-    } else if (!store.is_generated()) {
+               stores, store.get_dexen(), plugins, conf, mgr, root_refs_info,
+               cache);
+      break;
+    }
+  }
+
+  std::vector<DexStore*> parallel_stores;
+  for (auto& store : stores) {
+    if (!store.is_root_store() && !store.is_generated()) {
       parallel_stores.push_back(&store);
     }
   }

@@ -7,7 +7,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -20,9 +24,9 @@
 #include "IRList.h"
 #include "SourceBlocksUtils.h"
 
+class DexClass;
 class DexMethod;
 class DexStore;
-class ScopedMetrics;
 
 // Must match DexStore.
 using DexStoresVector = std::vector<DexStore>;
@@ -125,10 +129,9 @@ void visit_in_order_rec(const ControlFlowGraph* cfg,
   UnorderedSet<Block*> visited;
   self_recursive_fn(
       [&](auto self, Block* cur) {
-        if (visited.count(cur)) {
+        if (!visited.insert(cur).second) {
           return;
         }
-        visited.insert(cur);
 
         block_start_fn(cur);
 
@@ -170,11 +173,10 @@ void visit_in_order(const ControlFlowGraph* cfg,
     auto* cur = stack.top().cur;
 
     if (stack.top().initial) {
-      if (visited.count(cur)) {
+      if (!visited.insert(cur).second) {
         stack.pop();
         continue;
       }
-      visited.insert(cur);
 
       block_start_fn(cur);
 
@@ -266,18 +268,37 @@ struct SourceBlockMetric {
 
 SourceBlockMetric gather_source_block_metrics(ControlFlowGraph* cfg);
 
-void fix_chain_violations(ControlFlowGraph* cfg);
-
-void fix_idom_violations(ControlFlowGraph* cfg);
-
-void fix_hot_method_cold_entry_violations(ControlFlowGraph* cfg);
-
 bool has_source_block_positive_val(const SourceBlock* sb);
 
 bool has_source_block_undefined_val(const SourceBlock* sb);
 
-size_t compute_method_violations(const call_graph::Graph& call_graph,
-                                 const Scope& scope);
+// Whether two source blocks carry the same profile data, ignoring src, id and
+// next. SourceBlock::operator== leads with src and id, so it answers "are these
+// the same block", which is not the same question and is always false for
+// blocks of differing identity -- for example an original block and a synthetic
+// clone of it, which always carries kSyntheticId.
+inline bool vals_equal(const SourceBlock& lhs, const SourceBlock& rhs) {
+  if (lhs.vals_size != rhs.vals_size) {
+    return false;
+  }
+  for (size_t i = 0; i != lhs.vals_size; i++) {
+    if (lhs.get_at(i) != rhs.get_at(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Overwrite dst's profile data with from's, leaving dst's src, id and next
+// alone. SourceBlock::operator= copies the identity as well and replaces the
+// next chain, which loses the ids instrumentation resolves and, mid-traversal,
+// frees the chain still being walked.
+inline void set_vals(SourceBlock& dst, const SourceBlock& from) {
+  always_assert(dst.vals_size == from.vals_size);
+  for (size_t i = 0; i != dst.vals_size; i++) {
+    dst.set_at(i, from.get_at(i));
+  }
+}
 
 void scale_source_blocks(cfg::Block* block);
 
@@ -407,6 +428,107 @@ inline bool method_is_not_cold(const DexMethod* method) {
   const auto& cfg = method->get_code()->cfg();
   return is_not_cold(cfg.entry_block());
 }
+
+// The execution count a consumer reads from a single source block: the max over
+// interactions of its `val` (nullopt when `sb` is null or records no vals).
+// Callers wanting a plain float use `.value_or(0.0f)`. Intended as the single
+// definition of "a block's count" for the count-guided passes (outliner,
+// inliner, ArtProfileWriter) to share, so they can't drift apart.
+inline std::optional<float> max_val_over_interactions(const SourceBlock* sb) {
+  if (sb == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<float> max_val;
+  for (size_t i = 0; i < sb->vals_size; i++) {
+    auto v = sb->get_val(i);
+    if (v && (!max_val || *v > *max_val)) {
+      max_val = v;
+    }
+  }
+  return max_val;
+}
+
+// Two ways to pick a count cutoff from a set of block counts. They answer
+// DIFFERENT questions, so they are separate, named helpers -- don't mix them
+// up:
+//
+//   rank_cutoff_for_percentile(counts, p) = "the hottest (100 - p)% OF THE
+//     ITEMS." A rank percentile p in [0, 100], high = hot (LLVM convention):
+//     p = 95 keeps items at or above the 95th-percentile count -- the hottest
+//     5% of callsites. Every item counts once, no matter how big; a rarely-run
+//     callsite and a red-hot one each count as one. Test with `count >=
+//     cutoff`. Used by the inliner and ArtProfileWriter.
+//
+//   mass_coverage_cutoff(vals, c) = "the blocks that do c OF THE WORK."
+//     Items are weighted by their count, so a few very hot blocks can make up
+//     the fraction c -- e.g. the blocks where 90% of execution actually
+//     happens. Test with `val > cutoff` (boundary excluded: blocks exactly at
+//     the cutoff are NOT kept, so realized coverage can dip below c if many
+//     counts tie on it). Used by the outliner.
+//
+// In short: rank = "the hottest (100 - p)% of items"; mass = "the items that
+// do X% of the work."
+//
+// `counts` is sorted in place. Returns +inf when empty or p >= 100 (nothing is
+// "top") and -inf when p <= 0 (everything is).
+inline float rank_cutoff_for_percentile(std::vector<float>& counts,
+                                        int percentile) {
+  const float fraction = static_cast<float>(100 - percentile) / 100.0f;
+  if (counts.empty() || fraction <= 0.0f) {
+    return std::numeric_limits<float>::infinity();
+  }
+  if (fraction >= 1.0f) {
+    return -std::numeric_limits<float>::infinity();
+  }
+  std::sort(counts.begin(), counts.end());
+  auto idx = static_cast<size_t>((1.0f - fraction) *
+                                 static_cast<float>(counts.size()));
+  if (idx >= counts.size()) {
+    idx = counts.size() - 1;
+  }
+  return counts[idx];
+}
+
+// The execution-mass counterpart of rank_cutoff_for_percentile (see the
+// comparison above it). `vals` is sorted in place. Returns 0 when empty or
+// coverage >= 1 (protect every covered block) and max(vals) when coverage <= 0
+// (protect nothing).
+inline float mass_coverage_cutoff(std::vector<float>& vals, float coverage) {
+  if (vals.empty() || coverage >= 1.0f) {
+    return 0.0f;
+  }
+  // Sort hottest-first and walk down until the accumulated mass reaches the
+  // covered fraction; the count where we cross is the gate.
+  std::sort(vals.begin(), vals.end(), [](float a, float b) { return a > b; });
+  if (coverage <= 0.0f) {
+    return vals.front();
+  }
+  double total = 0.0;
+  for (float v : vals) {
+    total += v;
+  }
+  double target = coverage * total;
+  double acc = 0.0;
+  float gate = vals.back();
+  for (float v : vals) {
+    acc += v;
+    if (acc >= target) {
+      gate = v;
+      break;
+    }
+  }
+  return gate;
+}
+
+// Parallel gather of every block's execution count (its first source block's
+// max-over-interactions `val`), kept only when > 0, across `scope` --
+// optionally filtered by a per-(method, block) predicate (a null `include`
+// keeps every covered block). The pooled vector is ready to feed
+// `rank_cutoff_for_percentile` or `mass_coverage_cutoff`. Definition in
+// SourceBlocks.cpp (needs Walkers).
+std::vector<float> gather_block_counts(
+    const std::vector<DexClass*>& scope,
+    const std::function<bool(DexMethod*, cfg::Block*)>& include = {});
 
 template <typename Iterator>
 inline SourceBlock* find_between(const Iterator& start, const Iterator& end) {
@@ -563,7 +685,26 @@ inline float get_factor(SourceBlock* dominating,
 inline void normalize(SourceBlock* sb, size_t idx, float factor) {
   sb->apply_at(idx, [&](auto& val) {
     if (val) {
+      // Captured BEFORE the multiply: the product of two positives can flush
+      // to exactly 0.0f (1e-30 * 1e-20 == 1e-50, unrepresentable), and a `> 0`
+      // test on the RESULT cannot tell that underflow apart from a genuine
+      // zero. Guarding on the result is what the old 1e-3 floor did, which is
+      // why it never actually prevented an underflow.
+      const bool was_positive = val->val > 0.0f;
       val->val *= factor;
+      // A NaN `factor` (e.g. an unprofiled/none dominating block) turns `val`
+      // into "none" here, flipping `operator bool()` to false; re-guard before
+      // dereferencing again so the guard below never trips Val's operator->
+      // assertion.
+      //
+      // Underflow guard only: a positive val scaled by a positive factor must
+      // stay positive, or a hot block is silently reclassified as cold. A zero
+      // factor still yields a hard zero (cold caller zeroes the inlined body),
+      // and a NaN factor still yields "none" -- `factor > 0` excludes both.
+      if (val && was_positive && factor > 0.0f &&
+          val->val < kMinPositiveCount) {
+        val->val = kMinPositiveCount;
+      }
     }
   });
 }
@@ -587,7 +728,22 @@ inline void normalize(ControlFlowGraph& cfg,
   std::vector<float> factors;
   factors.reserve(interactions);
   for (size_t i = 0; i != interactions; ++i) {
-    factors.push_back(get_factor(dominating, dominated, i));
+    // Whole-CFG scaling (the inlining path): `dominating` is the callsite and
+    // `dominated` the callee entry, so the factor is this callsite's SHARE of
+    // the callee's executions and is at most 1. Two things push it above 1 --
+    // incomplete tracking, which get_factor already anticipates, and a
+    // denominator sitting on a positive-magnitude floor, which turns an
+    // ordinary numerator into a large multiplier on EVERY block of the inlined
+    // body. Clamp it; this also absorbs an overflow-to-inf quotient.
+    //
+    // Deliberately NOT inside get_factor: the two-SourceBlock overload uses
+    // that same helper for `dominated := dominating` assignment semantics,
+    // where a factor above 1 is meaningful and must not be clamped.
+    //
+    // NaN is passed through rather than collapsed by std::min's ordering, so
+    // an unprofiled dominating block still yields "no data" instead of 1.
+    const float f = get_factor(dominating, dominated, i);
+    factors.push_back(std::isnan(f) ? f : std::min(f, 1.0f));
   }
   for (auto* b : cfg.blocks()) {
     source_blocks::foreach_source_block(b, [&](auto* sb) {
@@ -609,49 +765,55 @@ inline void normalize(ControlFlowGraph& cfg,
 
 } // namespace normalize
 
-void track_source_block_coverage(ScopedMetrics& sm,
-                                 const DexStoresVector& stores);
+namespace apportion {
+
+// Count-conserving apportionment, shared by every transform that duplicates a
+// block or drops one of its predecessors.
+//
+// Needs only PREDECESSOR counts, never edge counts: Redex does not track edge
+// hotness, and a predecessor's share of a block's inflow is the standard
+// estimate when block counts are known and edge counts are not. It is an
+// estimate -- a predecessor with branch successors does not send all its flow
+// to one successor -- but it never invents mass.
+//
+// `appear100` is never scaled by any of these: it is an appearance
+// probability, MAX-unioned across copies, so a verbatim carry is right for it.
+
+// Per-interaction sum of the LAST SourceBlock val over every predecessor of
+// `b` -- the last one, because that is a predecessor's outflow, which is what
+// its successors receive.
+//
+// A predecessor with no SourceBlock contributes nothing, so it also does not
+// widen the denominator: the shares below describe the inflow we have evidence
+// for, not all of it. Where some predecessors are unprofiled the remaining
+// shares are correspondingly larger, which errs towards moving too much count
+// onto a copy rather than leaving mass stranded on a block that no longer
+// receives it.
+std::vector<double> predecessor_totals(const cfg::Block* b, size_t n_slots);
+
+// Share of `b`'s inflow attributable to `src`, given `b`'s predecessor totals.
+// Returns -1.0 for "no count evidence for this slot", which callers must treat
+// as "leave alone": a predecessor whose SourceBlock reads 0 IS evidence (it
+// correctly yields a cold share), whereas a predecessor with no SourceBlock is
+// absence. Conflating the two turns copies of unprofiled predecessors cold.
+double share_of(const std::vector<double>& pred_total,
+                const cfg::Block* src,
+                size_t i);
+
+// sb->val[i] *= f. Leaves a `none` val and appear100 untouched.
+void scale_val(SourceBlock* sb, size_t i, double f);
+
+// Scale every SourceBlock of `b` -- chain included, since they annotate the
+// same program point and so describe the same execution count -- by
+// clamp(1 - leaving_share[i], 0, 1). The counterpart to handing
+// `leaving_share` to the copies that took it.
+void shrink_by_departed(cfg::Block* b,
+                        const std::vector<double>& leaving_share);
+
+} // namespace apportion
 
 class SourceBlockConsistencyCheck;
 SourceBlockConsistencyCheck& get_sbcc();
-
-struct ViolationsHelper {
-  struct ViolationsHelperImpl;
-  std::unique_ptr<ViolationsHelperImpl> impl;
-  bool track_intermethod_violations{false};
-  bool print_all_violations{false};
-  bool ignore_undefined{false};
-
-  enum class Violation {
-    kHotImmediateDomNotHot = 0,
-    kChainAndDom = 1,
-    kUncoveredSourceBlocks = 2,
-    kHotMethodColdEntry = 3,
-    kHotNoHotPred = 4,
-    KHotAllChildrenCold = 5,
-    kUncoveredThrowDelineatedBlocks = 6,
-    ViolationSize = 7,
-  };
-
-  ViolationsHelper(Violation v,
-                   const Scope& scope,
-                   size_t top_n,
-                   std::vector<std::string> to_vis,
-                   bool track_intermethod_violations,
-                   bool print_all_violations,
-                   bool ignore_undefined);
-  ~ViolationsHelper();
-
-  void process(ScopedMetrics* sm);
-  void silence();
-
-  ViolationsHelper(ViolationsHelper&& other) noexcept;
-  ViolationsHelper& operator=(ViolationsHelper&& rhs) noexcept;
-};
-
-size_t compute(ViolationsHelper::Violation v,
-               cfg::ControlFlowGraph& cfg,
-               bool ignore_undefined = false);
 
 SourceBlock* get_first_source_block_of_method(const DexMethod* m);
 

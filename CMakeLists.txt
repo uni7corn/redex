@@ -65,8 +65,6 @@ install(DIRECTORY tools/common tools/tool
         FILES_MATCHING PATTERN "*.h")
 
 file(GLOB_RECURSE redex_srcs
-        "analysis/max-depth/*.cpp"
-        "analysis/max-depth/*.h"
         "analysis/ip-reflection-analysis/*.cpp"
         "analysis/ip-reflection-analysis/*.h"
         "libredex/*.cpp"
@@ -77,6 +75,8 @@ file(GLOB_RECURSE redex_srcs
         "opt/*.h"
         "util/CommandProfiling.cpp"
         "util/CommandProfiling.h"
+        "util/Histogram.cpp"
+        "util/Histogram.h"
         "util/JemallocUtil.cpp"
         "util/JemallocUtil.h"
         "util/Sha1.cpp"

@@ -41,7 +41,7 @@ struct ReducedBlock {
   size_t code_size{0};
   bool is_hot{false};
 
-  std::vector<const cfg::Edge*> expand_preds(cfg::Block* src = nullptr) const;
+  UnorderedBag<const cfg::Edge*> expand_preds(cfg::Block* src = nullptr) const;
 };
 
 // A control-flow-graph where all strongly-connected components have been
@@ -58,6 +58,9 @@ class ReducedControlFlowGraph {
       const ReducedBlock* head,
       const UnorderedSet<const ReducedEdge*>& except_edges = {}) const;
 
+  // Never returns null: `block` must be non-null and must belong to the cfg
+  // this graph was reduced from. Both are programming errors and abort, in opt
+  // builds too -- callers must not null-check the result.
   ReducedBlock* get_reduced_block(const cfg::Block* block) const;
 
   size_t code_size() const { return m_code_size; }
@@ -78,11 +81,10 @@ class ReducedControlFlowGraph {
 
 template <class ReducedBlockCollection>
 size_t code_size(const ReducedBlockCollection& blocks) {
-  size_t res{0};
-  for (const ReducedBlock* block : UnorderedIterable(blocks)) {
-    res += block->code_size;
-  }
-  return res;
+  return unordered_accumulate(blocks, size_t{0},
+                              [](size_t acc, const ReducedBlock* block) {
+                                return acc + block->code_size;
+                              });
 }
 
 } // namespace method_splitting_impl

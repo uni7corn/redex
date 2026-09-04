@@ -8,9 +8,9 @@
 #include "ObjectSensitiveDcePass.h"
 
 #include <fstream>
-#include <functional>
 
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "InitClassesWithSideEffects.h"
 #include "LocalPointersAnalysis.h"

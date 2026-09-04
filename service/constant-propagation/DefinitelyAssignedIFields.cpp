@@ -16,6 +16,7 @@
 #include <sparta/ReducedProductAbstractDomain.h>
 
 #include "BaseIRAnalyzer.h"
+#include "Debug.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "LiveRange.h"
@@ -324,7 +325,7 @@ UnorderedSet<const DexField*> get_definitely_assigned_ifields(
         .first;
   };
   ConcurrentSet<const DexType*> classes_with_relaxed_invoke_init;
-  walk::code(scope, [&](DexMethod*, IRCode& code) {
+  walk::parallel::code(scope, [&](DexMethod*, IRCode& code) {
     auto ii = InstructionIterable(code.cfg());
     if (std::none_of(ii.begin(), ii.end(), [](auto& mie) {
           return opcode::is_new_instance(mie.insn->opcode());

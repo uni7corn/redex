@@ -1,8 +1,9 @@
 include $(top_srcdir)/Makefile.inc
 include $(top_srcdir)/test/Makefile.inc
 
-DX = @DX@
+D8 = @D8@
 
+ANDROID_JAR = @ANDROID_JAR@
 ANDROID_SDK = @ANDROID_SDK@
 ANDROID_PLATFORM_VERSION = @ANDROID_PLATFORM_VERSION@
 
@@ -36,7 +37,6 @@ check_PROGRAMS = \
     instruction_sequence_outliner_test \
     iodi_test \
     ip_reflection_analysis_test \
-    max_depth_test \
     method_override_graph_test \
     monotonic_fixpoint_test \
     partial_application_test \
@@ -90,7 +90,6 @@ TESTS = \
     final_inline_analysis_test \
     iodi_test \
     ip_reflection_analysis_test \
-    max_depth_test \
     method_override_graph_test \
     peephole_test \
     points_to_semantics_test \
@@ -163,9 +162,6 @@ EXTRA_iodi_test_DEPENDENCIES = iodi_test-class.dex
 ip_reflection_analysis_test_SOURCES = IPReflectionAnalysisTest.cpp
 EXTRA_ip_reflection_analysis_test_DEPENDENCIES = ip_reflection_analysis_test-class.dex
 
-max_depth_test_SOURCES = MaxDepthAnalysisTest.cpp
-EXTRA_max_depth_test_DEPENDENCIES = max_depth_test-class.dex
-
 method_override_graph_test_SOURCES = MethodOverrideGraphTest.cpp
 EXTRA_method_override_graph_test_DEPENDENCIES = method_override_graph_test-class.dex
 
@@ -220,8 +216,12 @@ EXTRA_uses_app_module_annotation_test_DEPENDENCIES = uses_app_module_annotation-
 verifier_artifacts_test_SOURCES = VerifierTest.cpp
 EXTRA_verifier_artifacts_test_DEPENDENCIES = verifier_artifacts_test-class.dex
 
-# Note: Should switch to d8, instead.
-javac_source_target = -source 8 -target 8
+# -parameters works around a D8 bug in the pinned build-tools 29.0.2: javac 21+
+# emits a nameless MethodParameters entry for an inner class constructor's
+# mandated outer-instance parameter, and that D8 dereferences the null name.
+# Naming every parameter avoids it. D8 discards the attribute, so the dex is
+# byte-identical either way.
+javac_source_target = -source 8 -target 8 -parameters
 
 define create_jar
 	mkdir -p $@.tmp
@@ -232,7 +232,10 @@ endef
 SUFFIXES = .dex
 
 .jar.dex:
-	$(DX) --dex --output=$@ $^
+	rm -rf $@.d8 && $(MKDIR_P) $@.d8
+	$(D8) --intermediate --output $@.d8 --lib $(ANDROID_JAR) $^
+	mv $@.d8/classes.dex $@
+	rm -rf $@.d8
 
 app_module_usage_test-class.jar: AppModuleUsageClass.java
 	$(create_jar)
@@ -283,9 +286,6 @@ iodi_test-class.jar: IODI.java
 	$(create_jar)
 
 ip_reflection_analysis_test-class.jar: IPReflectionAnalysisTest.java
-	$(create_jar)
-
-max_depth_test-class.jar: MaxDepthAnalysisTest.java
 	$(create_jar)
 
 method_override_graph_test-class.jar: MethodOverrideGraphTest.java

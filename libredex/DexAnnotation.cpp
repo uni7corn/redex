@@ -385,8 +385,7 @@ void DexEncodedValueAnnotation::encode(DexOutputIdx* dodx,
 
 static DexAnnotationElement get_annotation_element(DexIdx* idx,
                                                    const uint8_t*& encdata) {
-  always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t sidx = read_uleb128(&encdata);
+  uint32_t sidx = idx->read_uleb128_checked(&encdata);
   const auto* name = idx->get_stringidx(sidx);
   always_assert_type_log(name != nullptr, INVALID_DEX,
                          "Invalid string idx in annotation element");
@@ -396,10 +395,12 @@ static DexAnnotationElement get_annotation_element(DexIdx* idx,
 
 std::unique_ptr<DexEncodedValueArray> get_encoded_value_array(
     DexIdx* idx, const uint8_t*& encdata) {
-  always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t size = read_uleb128(&encdata);
+  uint32_t size = idx->read_uleb128_checked(&encdata);
   using Vec = std::vector<std::unique_ptr<DexEncodedValue>>;
   auto evlist = Vec{};
+  always_assert_type_log(size <= static_cast<uint64_t>(idx->end() - encdata),
+                         INVALID_DEX,
+                         "Encoded value array size exceeds dex size");
   evlist.reserve(size);
   for (uint32_t i = 0; i < size; i++) {
     evlist.emplace_back(DexEncodedValue::get_encoded_value(idx, encdata));
@@ -608,13 +609,14 @@ std::unique_ptr<DexEncodedValue> DexEncodedValue::get_encoded_value(
   case DEVT_ANNOTATION: {
     always_assert_type_log(evarg == 0, INVALID_DEX, "evarg out of bounds");
     EncodedAnnotations eanno{};
-    always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-    uint32_t tidx = read_uleb128(&encdata);
-    always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-    uint32_t count = read_uleb128(&encdata);
+    uint32_t tidx = idx->read_uleb128_checked(&encdata);
+    uint32_t count = idx->read_uleb128_checked(&encdata);
     DexType* type = idx->get_typeidx(tidx);
     always_assert_type_log(type != nullptr, INVALID_DEX,
                            "Invalid DEVT_ANNOTATION within annotation type");
+    always_assert_type_log(count <= static_cast<uint64_t>(idx->end() - encdata),
+                           INVALID_DEX,
+                           "Encoded annotation element count exceeds dex size");
     eanno.reserve(count);
     for (uint32_t i = 0; i < count; i++) {
       eanno.emplace_back(get_annotation_element(idx, encdata));
@@ -636,15 +638,16 @@ std::unique_ptr<DexAnnotation> DexAnnotation::get_annotation(
   uint8_t viz = *encdata++;
   always_assert_type_log(viz <= DAV_SYSTEM, INVALID_DEX,
                          "Invalid annotation visibility %d", viz);
-  always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t tidx = read_uleb128(&encdata);
-  always_assert_type_log(encdata < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t count = read_uleb128(&encdata);
+  uint32_t tidx = idx->read_uleb128_checked(&encdata);
+  uint32_t count = idx->read_uleb128_checked(&encdata);
   DexType* type = idx->get_typeidx(tidx);
   always_assert_type_log(type != nullptr, INVALID_DEX,
                          "Invalid annotation type");
   auto anno =
       std::make_unique<DexAnnotation>(type, (DexAnnotationVisibility)viz);
+  always_assert_type_log(count <= static_cast<uint64_t>(idx->end() - encdata),
+                         INVALID_DEX,
+                         "Annotation element count exceeds dex size");
   anno->m_anno_elems.reserve(count);
   for (uint32_t i = 0; i < count; i++) {
     anno->m_anno_elems.emplace_back(get_annotation_element(idx, encdata));

@@ -9,6 +9,8 @@
 
 #include <optional>
 
+#include <sparta/MonotonicFixpointIterator.h>
+
 #include "DeterministicContainers.h"
 #include "GraphUtil.h"
 
@@ -70,6 +72,12 @@ class SimpleFastDominators {
 
   NodeId get_idom(NodeId node) const { return m_idoms.at(node); }
 
+  // True when `node` has a recorded immediate dominator. Nodes absent from the
+  // computation (for the post-dominator instantiation, blocks that cannot reach
+  // the exit) return false; query this before `get_idom` rather than catching
+  // the throwing `at()` lookup.
+  bool has_idom(NodeId node) const { return m_idoms.count(node) != 0u; }
+
   // Find the common dominator block that is closest to both blocks.
   NodeId intersect(NodeId finger1, NodeId finger2) {
     while (finger1 != finger2) {
@@ -88,5 +96,24 @@ class SimpleFastDominators {
   std::vector<NodeId> m_postordering;
   UnorderedMap<NodeId, size_t> m_postorder_map;
 };
+
+// Post-dominators are just dominators over the reversed graph. sparta's
+// BackwardsFixpointIterationAdaptor provides the reversal (swaps entry<->exit
+// and pred<->succ), so this alias is the canonical, readable way to spell
+// post-dominators instead of repeating the verbose adaptor at every call site
+// (e.g. the std::conditional_t form in SourceBlockConsistencyCheck.h).
+//
+// PRECONDITION: the GraphInterface must expose an exit node. For
+// `cfg::GraphInterface` that means the underlying `cfg::ControlFlowGraph` must
+// have had `calculate_exit_block()` called. If it wasn't, the exit is nullptr
+// and the constructor will dereference it (crash) or otherwise produce garbage
+// — a recurring pitfall on freshly-built or freshly-mutated CFGs. Call
+// `cfg.calculate_exit_block()` BEFORE constructing the post-dominators.
+//
+// Only nodes that can reach the exit are included; query get_idom() only
+// for those (it throws std::out_of_range otherwise).
+template <class GraphInterface>
+using SimpleFastPostDominators = SimpleFastDominators<
+    sparta::BackwardsFixpointIterationAdaptor<GraphInterface>>;
 
 } // namespace dominators

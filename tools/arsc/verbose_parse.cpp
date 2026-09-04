@@ -7,7 +7,6 @@
 
 #include <boost/iostreams/device/mapped_file.hpp>
 #include <boost/program_options.hpp>
-#include <fstream>
 #include <iostream>
 
 #include "utils/Visitor.h"

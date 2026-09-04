@@ -8,6 +8,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "Debug.h"
+#include "DeterministicContainers.h"
 #include "DexAnnotation.h"
 #include "DexClass.h"
 #include "DexInstruction.h"
@@ -17,7 +19,6 @@
 #include "LiveRange.h"
 #include "MaterializeResourceConstants.h"
 #include "RClass.h"
-#include "RedexContext.h"
 #include "RedexTest.h"
 #include "Show.h"
 #include "ShowCFG.h"

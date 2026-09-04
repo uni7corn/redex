@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 
+#include "BlockOffsetSink.h"
 #include "ControlFlow.h"
 #include "Debug.h"
 #include "DebugUtils.h"
@@ -109,6 +110,7 @@ bool encode_offset(IRList* ir, MethodItemEntry* target_mie, int32_t offset) {
   // fallthrough. The offset is measured in 16 bit code units, not
   // MethodItemEntries
   if (offset == static_cast<int32_t>(insn->size())) {
+    delete branch_op_mie->dex_insn;
     branch_op_mie->type = MFLOW_FALLTHROUGH;
     delete target_mie->target;
     target_mie->type = MFLOW_FALLTHROUGH;
@@ -587,6 +589,9 @@ std::unique_ptr<IRList> deep_copy_ir_list(IRList* old_ir_list) {
       new (&copy_mie->src_block)
           std::unique_ptr<SourceBlock>(new SourceBlock(*mie.src_block));
       break;
+    case MFLOW_REMARK:
+      new (&copy_mie->remark) std::unique_ptr<Remark>(new Remark(*mie.remark));
+      break;
     case MFLOW_FALLTHROUGH:
       break;
     case MFLOW_DEX_OPCODE:
@@ -803,7 +808,7 @@ void calculate_ins_size(const DexMethod* method, DexCode* dex_code) {
  */
 void gather_debug_entries(
     IRList* ir_list,
-    const UnorderedMap<MethodItemEntry*, uint32_t>& entry_to_addr,
+    const UnorderedMap<const MethodItemEntry*, uint32_t>& entry_to_addr,
     std::vector<DexDebugEntry>* entries) {
   bool next_pos_is_root{false};
   // A root is the first DexPosition that precedes an opcode
@@ -889,12 +894,17 @@ void IRCode::split_and_insert_try_regions(
 
 std::unique_ptr<DexCode> IRCode::sync(const DexMethod* method) {
   auto dex_code = std::make_unique<DexCode>();
+  // dexvt: the sink wants each MethodItemEntry's final code-unit address, which
+  // try_sync builds internally anyway. Off by default -- one relaxed atomic
+  // load per method, no map allocated, no per-instruction work.
+  const bool capture = block_offset_sink::enabled();
+  UnorderedMap<const MethodItemEntry*, uint32_t> entry_addresses;
   try {
     calculate_ins_size(method, &*dex_code);
     dex_code->set_registers_size(m_registers_size);
     dex_code->set_outs_size(calc_outs_size(this));
     dex_code->set_debug_item(std::move(m_dbg));
-    while (!try_sync(dex_code.get())) {
+    while (!try_sync(dex_code.get(), capture ? &entry_addresses : nullptr)) {
       ;
     }
   } catch (const std::exception& e) {
@@ -910,11 +920,16 @@ std::unique_ptr<DexCode> IRCode::sync(const DexMethod* method) {
     }
   }
 
+  if (capture) {
+    block_offset_sink::resolve(method, entry_addresses);
+  }
   return dex_code;
 }
 
-bool IRCode::try_sync(DexCode* code) {
-  UnorderedMap<MethodItemEntry*, uint32_t> entry_to_addr;
+bool IRCode::try_sync(
+    DexCode* code,
+    UnorderedMap<const MethodItemEntry*, uint32_t>* entry_addresses) {
+  UnorderedMap<const MethodItemEntry*, uint32_t> entry_to_addr;
   uint32_t addr = 0;
   // Step 1, regenerate opcode list for the method, and
   // and calculate the opcode entries address offsets.
@@ -1111,21 +1126,34 @@ bool IRCode::try_sync(DexCode* code) {
   always_assert(invoke_ids.empty());
   DexPosition* last_position{nullptr};
   SourceBlock* last_src_block{nullptr};
-  std::vector<IRList::iterator> src_blocks;
+  // Source blocks (after being consumed for invoke ids) and remarks are both
+  // redex-internal and never serialized to dex; collect them here to dispose
+  // once the loop is done.
+  std::vector<IRList::iterator> miters_to_dispose;
   for (auto miter = m_ir_list->begin(); miter != m_ir_list->end(); ++miter) {
     MethodItemEntry* mentry = &*miter;
-    if (mentry->type == MFLOW_POSITION) {
+    switch (mentry->type) {
+    case MFLOW_POSITION:
       last_position = mentry->pos.get();
       continue;
-    }
-    if (mentry->type == MFLOW_SOURCE_BLOCK) {
+    case MFLOW_SOURCE_BLOCK:
       last_src_block = mentry->src_block.get();
-      src_blocks.push_back(miter);
+      miters_to_dispose.push_back(miter);
+      continue;
+    case MFLOW_DEX_OPCODE:
+      break;
+    case MFLOW_REMARK:
+      miters_to_dispose.push_back(miter);
+      continue;
+    case MFLOW_TRY:
+    case MFLOW_CATCH:
+    case MFLOW_OPCODE:
+    case MFLOW_TARGET:
+    case MFLOW_DEBUG:
+    case MFLOW_FALLTHROUGH:
       continue;
     }
-    if (mentry->type != MFLOW_DEX_OPCODE) {
-      continue;
-    }
+    always_assert(mentry->type == MFLOW_DEX_OPCODE);
     auto* dex_insn = mentry->dex_insn;
     auto opcode = dex_insn->opcode();
     if (!dex_opcode::is_invoke(opcode)) {
@@ -1145,8 +1173,8 @@ bool IRCode::try_sync(DexCode* code) {
                                               last_position, last_src_block));
   }
 
-  // Remove any source blocks. They are no longer necessary.
-  for (const auto& miter : src_blocks) {
+  // Dispose the collected source blocks and remarks.
+  for (const auto& miter : miters_to_dispose) {
     m_ir_list->erase_and_dispose(miter);
   }
 
@@ -1206,6 +1234,11 @@ bool IRCode::try_sync(DexCode* code) {
                const std::unique_ptr<DexTryItem>& b) {
               return a->m_start_addr < b->m_start_addr;
             });
+  if (entry_addresses != nullptr) {
+    // Only the successful pass gets here, so a caller sees the layout that was
+    // actually emitted.
+    *entry_addresses = std::move(entry_to_addr);
+  }
   return true;
 }
 

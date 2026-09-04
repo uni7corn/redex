@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "Debug.h"
 #include "InsertSourceBlocks.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include "ScopedCFG.h"
 #include "Show.h"
 #include "SourceBlocks.h"
+#include "SourceBlocksViolations.h"
 #include "Walkers.h"
 
 class SourceBlocksTest : public RedexIntegrationTest {
@@ -249,16 +251,16 @@ TEST_F(SourceBlocksTest, source_blocks) {
 
     std::string bar_str = assembler::to_string(bar->get_code());
     EXPECT_EQ(bar_str,
-              "((load-param-object v1) (.dbg DBG_SET_PROLOGUE_END) (.pos:dbg_0 "
+              "((load-param-object v1) (.pos:dbg_0 "
               "\"Lcom/facebook/redextest/SourceBlocksTest;.bar:()V\" "
               "SourceBlocksTest.java 18) (.src_block "
-              "\"Lcom/facebook/redextest/SourceBlocksTest;.bar:()V\" 0 ())"
+              "\"Lcom/facebook/redextest/SourceBlocksTest;.bar:()V\" 0)"
               " (const-string World) (move-result-pseudo-object v0) "
               "(move-object v2 v1) (move-object v3 v0) (.pos:dbg_1 "
               "\"Lcom/facebook/redextest/SourceBlocksTest;.baz:(Ljava/lang/"
               "String;)V\" SourceBlocksTest.java 22 dbg_0) (.src_block "
               "\"Lcom/facebook/redextest/SourceBlocksTest;.baz:(Ljava/lang/"
-              "String;)V\" 0 ()) (iput-object v3 v2 "
+              "String;)V\" 0) (iput-object v3 v2 "
               "\"Lcom/facebook/redextest/SourceBlocksTest;.mHello:Ljava/lang/"
               "String;\") (.pos:dbg_2 "
               "\"Lcom/facebook/redextest/SourceBlocksTest;.bar:()V\" "
@@ -311,6 +313,13 @@ TEST_F(SourceBlocksTest, source_blocks_insert_after_exc) {
        "String;)Ljava/lang/String;",
        2},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V", 2},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       2},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V", 2},
   };
 
   for (auto* m : cls->get_all_methods()) {
@@ -506,6 +515,14 @@ TEST_F(SourceBlocksTest, source_blocks_profile) {
        "B0: 0(0:0)"},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V",
        "B0: 0(0:0)"},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       "B0: 0(0:0)"},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V",
+       "B0: 0(0:0)"},
   };
 
   for (auto* m : cls->get_all_methods()) {
@@ -566,6 +583,13 @@ TEST_F(SourceBlocksTest, source_blocks_profile_no_always_inject) {
        "String;)Ljava/lang/String;",
        "B0:"},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V", "B0:"},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       "B0:"},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V", "B0:"},
   };
 
   for (auto* m : cls->get_all_methods()) {
@@ -631,6 +655,14 @@ TEST_F(SourceBlocksTest, source_blocks_profile_exc) {
        "B0: 0(0:0) 1(0:0)"},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V",
        "B0: 0(0:0) 1(0:0)"},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       "B0: 0(0:0) 1(0:0)"},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V",
+       "B0: 0(0:0) 1(0:0)"},
   };
 
   for (auto* m : cls->get_all_methods()) {
@@ -693,6 +725,13 @@ TEST_F(SourceBlocksTest, source_blocks_profile_exc_no_always_inject) {
        "String;)Ljava/lang/String;",
        "B0:"},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V", "B0:"},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       "B0:"},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V", "B0:"},
   };
 
   for (auto* m : cls->get_all_methods()) {
@@ -765,6 +804,14 @@ TEST_F(SourceBlocksTest, source_blocks_profile_always_inject_method_profiles) {
        "String;)Ljava/lang/String;",
        "B0: 0(0:0)"},
       {"Lcom/facebook/redextest/SourceBlocksTest;.access$100:()V",
+       "B0: 0(0:0)"},
+      // D8 desugars javac 11+ nestmates into these bridges; javac 8 emits the
+      // access$NNN pair above instead. Both forms are listed so the map stays
+      // exhaustive whichever javac target the fixture is compiled with.
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$sfputmWorld:(Ljava/"
+       "lang/String;)V",
+       "B0: 0(0:0)"},
+      {"Lcom/facebook/redextest/SourceBlocksTest;.-$$Nest$smbazzz:()V",
        "B0: 0(0:0)"},
   };
 
@@ -1124,6 +1171,51 @@ TEST_F(SourceBlocksTest, test_counting_with_idom_violations) {
       source_blocks::ViolationsHelper::Violation::kChainAndDom,
       method->get_code()->cfg());
 
+  // The fixture is a plain if/else diamond (see `IDomBlockCounting.idom`) --
+  // there is no loop in it. The synthetic profile gives the branch block val 1
+  // and one arm val 2, and an arm of an `if` has exactly one predecessor, which
+  // is also its immediate dominator. An arm cannot run more often than the
+  // branch that guards it, so this is a genuine inconsistency rather than the
+  // loop amplification `dom_cold_block_hot` was introduced to stop
+  // false-positiving on.
+  //
+  // The straight-line magnitude check therefore fires here, and should: with a
+  // single predecessor there is no back edge to amplify the block.
+  ASSERT_EQ(violations, 1);
+}
+
+// Positive counterpart to test_counting_with_idom_violations: a genuine
+// cold->hot coverage inversion (the entry, i.e. the immediate dominator, is
+// UNCOVERED while a block it dominates is covered) MUST still be reported by
+// the boolean-ized kChainAndDom check. Guards against the fix silencing real
+// violations.
+TEST_F(SourceBlocksTest, test_counting_with_idom_chain_dom_violation) {
+  auto* profile_path = std::getenv("idom-chain-dom-violation");
+  ASSERT_NE(profile_path, nullptr) << "Missing profile path.";
+
+  auto* type = DexType::get_type(
+      "Lcom/facebook/redextest/SourceBlocksTest$IDomBlockCounting;");
+  ASSERT_NE(type, nullptr);
+  auto* cls = type_class(type);
+  ASSERT_NE(cls, nullptr);
+
+  InsertSourceBlocksPass isbp{};
+  run_passes({&isbp}, nullptr, Json::nullValue, [&](const auto&) {
+    enable_pass(isbp);
+    set_insert_after_excs(isbp, false);
+    set_profile(isbp, profile_path);
+    set_force_serialize(isbp);
+  });
+
+  auto* method = cls->find_method_from_simple_deobfuscated_name("idom");
+  method->get_code()->build_cfg();
+  auto violations = source_blocks::compute(
+      source_blocks::ViolationsHelper::Violation::kChainAndDom,
+      method->get_code()->cfg());
+
+  // Exactly one inversion: the single covered (val 1) block whose immediate
+  // dominator (the entry) is uncovered (val 0). The other blocks are uncovered,
+  // so the boolean predicate does not fire for them.
   ASSERT_EQ(violations, 1);
 }
 
@@ -1358,3 +1450,41 @@ INSTANTIATE_TEST_SUITE_P(
          "SourceBlocksTest;.access$redex1bc24000ccc37110$00:()V@0(0.8:0."
          "9)"}}),
     [](const auto& info) { return info.param.profile; });
+
+// End-to-end check that `violations_tracking.enabled` reaches the per-pass
+// metrics through PassManager: config -> ViolationsTracking -> the per-pass
+// Handler -> ScopedMetrics -> PassManager::set_metric.
+TEST_F(SourceBlocksTest, violations_tracking_emits_per_pass_metrics) {
+  Json::Value tracking = Json::objectValue;
+  tracking["enabled"] = true;
+  Json::Value conf_val = Json::objectValue;
+  conf_val["violations_tracking"] = tracking;
+
+  InsertSourceBlocksPass isbp{};
+  run_passes({&isbp}, nullptr, conf_val, [&](const auto&) {
+    enable_pass(isbp);
+    enable_always_inject(isbp);
+  });
+
+  const auto& pass_info = pass_manager->get_pass_info();
+  ASSERT_EQ(pass_info.size(), 1u);
+  const auto& metrics = pass_info.front().metrics;
+  EXPECT_NE(metrics.find("~violation~tracking.new_violations"), metrics.end());
+  EXPECT_NE(metrics.find("~violation~tracking.new_method_violations"),
+            metrics.end());
+}
+
+// The same run without the flag must not report anything, so that enabling
+// tracking is what adds the metrics rather than the other way around.
+TEST_F(SourceBlocksTest, violations_tracking_is_off_by_default) {
+  InsertSourceBlocksPass isbp{};
+  run_passes({&isbp}, nullptr, Json::nullValue, [&](const auto&) {
+    enable_pass(isbp);
+    enable_always_inject(isbp);
+  });
+
+  const auto& pass_info = pass_manager->get_pass_info();
+  ASSERT_EQ(pass_info.size(), 1u);
+  const auto& metrics = pass_info.front().metrics;
+  EXPECT_EQ(metrics.find("~violation~tracking.new_violations"), metrics.end());
+}

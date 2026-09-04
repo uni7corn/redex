@@ -13,6 +13,7 @@
 #include "ConstantEnvironment.h"
 #include "ConstantPropagationAnalysis.h"
 #include "ConstantPropagationWholeProgramState.h"
+#include "Debug.h"
 #include "Lazy.h"
 #include "LiveRange.h"
 #include "RedexContext.h"
@@ -271,7 +272,7 @@ void WrappedPrimitives::optimize_method(
         const auto& reg_env = env.get_register_environment();
 
         bool updated_ref{false};
-        auto* updated_insn = new IRInstruction(*insn);
+        auto updated_insn = std::make_unique<IRInstruction>(*insn);
         // HELPER FUNCTIONS
         auto perform_unwrapping = [&](const DexType* wrapper_type,
                                       src_index_t idx, reg_t literal_reg) {
@@ -386,7 +387,7 @@ void WrappedPrimitives::optimize_method(
           }
         } // END SRCS FOR LOOP
         if (updated_ref) {
-          std::vector<IRInstruction*> replacements{updated_insn};
+          std::vector<IRInstruction*> replacements{updated_insn.release()};
           if (!move_result_it.is_end()) {
             replacements.push_back(new IRInstruction(*move_result_it->insn));
           }

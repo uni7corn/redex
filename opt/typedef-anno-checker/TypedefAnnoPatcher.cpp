@@ -7,6 +7,8 @@
 
 #include "TypedefAnnoPatcher.h"
 
+#include "ControlFlow.h"
+#include "Debug.h"
 #include "PassManager.h"
 #include "Resolver.h"
 #include "Show.h"

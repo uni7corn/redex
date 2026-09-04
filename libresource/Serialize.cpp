@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <boost/functional/hash.hpp>
 #include <cstddef>
-#include <iostream>
 #include <limits>
 #include <vector>
 

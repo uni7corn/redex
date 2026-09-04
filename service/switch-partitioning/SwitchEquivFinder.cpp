@@ -13,6 +13,7 @@
 
 #include "CFGMutation.h"
 #include "ConstantPropagationAnalysis.h"
+#include "Debug.h"
 #include "IRList.h"
 #include "LiveRange.h"
 #include "ReachingDefinitions.h"
@@ -147,7 +148,7 @@ bool is_sled(cfg::Block* b) {
     return false;
   }
   for (auto it = b->begin(); it != b->end(); it++) {
-    if (it->type != MFLOW_SOURCE_BLOCK) {
+    if (it->type != MFLOW_SOURCE_BLOCK && it->type != MFLOW_REMARK) {
       return false;
     }
   }
@@ -483,6 +484,58 @@ std::vector<cfg::Edge*> SwitchEquivFinder::find_leaves() {
   return leaves;
 }
 
+namespace {
+
+// Split a duplicated block's execution count between the original and the copy
+// when one predecessor edge moves to the copy. `duplicate_block` copies
+// SourceBlocks verbatim, so without this both blocks claim the whole count.
+//
+// The two sides need different factors when several edges move in turn. The
+// original shrinks step by step, so its share is taken against its current
+// predecessor set. Each copy, though, still holds the pre-split count -- it
+// does not shrink as earlier edges depart -- so scaling it by a fraction of the
+// original's already-reduced total would leave it inflated. Take the copy's
+// factor against its own value instead, which makes each copy land on exactly
+// the count its moved predecessor contributes, whatever order the edges move
+// in.
+void split_counts_for_moved_edge(cfg::Block* orig,
+                                 cfg::Block* copy,
+                                 const cfg::Block* moved_from) {
+  auto* orig_sb = source_blocks::get_first_source_block(orig);
+  const size_t n_slots = orig_sb != nullptr ? orig_sb->vals_size : 0;
+  if (n_slots == 0) {
+    return;
+  }
+  const auto pred_total =
+      source_blocks::apportion::predecessor_totals(orig, n_slots);
+  auto* copy_sb = source_blocks::get_first_source_block(copy);
+  const auto* moved_sb = source_blocks::get_last_source_block(moved_from);
+  std::vector<double> leaving(n_slots, 0.0);
+  for (size_t i = 0; i < n_slots; ++i) {
+    const double share =
+        source_blocks::apportion::share_of(pred_total, moved_from, i);
+    if (share < 0.0) {
+      continue; // no count evidence for this slot -- leave both alone
+    }
+    leaving[i] = share;
+    if (copy_sb == nullptr || moved_sb == nullptr) {
+      continue;
+    }
+    const double copy_val = copy_sb->get_val(i).value_or(0.0f);
+    if (copy_val <= 0.0) {
+      continue;
+    }
+    const double moved_val = moved_sb->get_val(i).value_or(0.0f);
+    const double copy_factor = moved_val / copy_val;
+    source_blocks::foreach_source_block(copy, [&](auto* sb) {
+      source_blocks::apportion::scale_val(sb, i, copy_factor);
+    });
+  }
+  source_blocks::apportion::shrink_by_departed(orig, leaving);
+}
+
+} // namespace
+
 bool SwitchEquivFinder::move_edges(
     const std::vector<std::pair<cfg::Edge*, cfg::Block*>>& edges_to_move) {
   for (const auto& pair : edges_to_move) {
@@ -527,6 +580,13 @@ bool SwitchEquivFinder::move_edges(
       cfg::Edge* copy_succ = new cfg::Edge(*orig_succ);
       m_cfg->add_edge(copy_succ);
       m_cfg->set_edge_source(copy_succ, copy);
+    }
+    // Before the retarget, while `edge->src()` still counts as a predecessor of
+    // `orig`. Done here rather than where the copy was made, because a copy
+    // whose loads converged with the original is discarded above and never
+    // takes any of its count.
+    if (g_redex->preserve_count_integrity) {
+      split_counts_for_moved_edge(orig, copy, edge->src());
     }
     m_cfg->set_edge_target(edge, copy);
   }
@@ -604,8 +664,8 @@ void SwitchEquivFinder::normalize_extra_loads(
 cp::intraprocedural::FixpointIterator& SwitchEquivFinder::get_analyzed_cfg() {
   if (!m_fixpoint_iterator) {
     m_fixpoint_iterator =
-        std::make_shared<cp::intraprocedural::FixpointIterator>(
-            /* cp_state */ nullptr, *m_cfg, Analyzer());
+        std::make_shared<cp::intraprocedural::FixpointIterator>(*m_cfg,
+                                                                Analyzer());
     m_fixpoint_iterator->run(ConstantEnvironment());
   }
   return *m_fixpoint_iterator;
@@ -785,6 +845,13 @@ size_t SwitchEquivEditor::normalize_sled_blocks(
               "Removing sled block B%zu; duplicating instructions from B%zu",
               b->id(), dest->id());
         auto* replacement = cfg->duplicate_block(dest);
+        // Scale before b's own SourceBlocks are prepended below, so only the
+        // ones duplicated from `dest` are touched. `b` is about to be replaced
+        // by this copy, so `dest` keeps its other predecessors and sheds the
+        // flow that used to arrive through the sled.
+        if (g_redex->preserve_count_integrity) {
+          split_counts_for_moved_edge(dest, replacement, b);
+        }
         for (auto* succ : dest->succs()) {
           cfg->add_edge(replacement, succ->target(), succ->type());
         }

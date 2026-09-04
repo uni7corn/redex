@@ -8,8 +8,10 @@
 #include "DexTypeEnvironment.h"
 
 #include <ostream>
+#include <vector>
 
-#include "OptionalIO.h"
+#include "Debug.h"
+#include "DeterministicContainers.h"
 #include "Show.h"
 
 namespace dtv_impl {
@@ -32,24 +34,68 @@ bool implements(const DexClass* cls, const DexType* intf) {
   return false;
 }
 
-// Is `left` a subset of `right`
-bool is_subset(DexTypeList* left, DexTypeList* right) {
-  std::unordered_set<const DexType*> rset(right->begin(), right->end());
-  for (const auto* ltype : *left) {
-    if (rset.count(ltype) == 0) {
-      return false;
+/*
+ * Every interface `type` implements: those its class declares, everything
+ * those extend, and the same again for each super class. `implements` above
+ * walks only the super class chain, so it cannot answer this.
+ *
+ * TypeSystem::get_implemented_interfaces computes the same thing, but building
+ * a TypeSystem builds ClassScopes, which is far too expensive to do per join.
+ */
+void collect_interfaces(const DexType* type,
+                        UnorderedSet<const DexType*>* out) {
+  for (const auto* cls = type_class(type); cls != nullptr;
+       cls = type_class(cls->get_super_class())) {
+    for (const auto* const intf : *cls->get_interfaces()) {
+      // Guard against re-walking a shared ancestor of a diamond.
+      if (out->insert(intf).second) {
+        collect_interfaces(intf, out);
+      }
     }
   }
-  return true;
 }
 
-// Can the interface identity of `left` be merged into `right`.
-bool are_interfaces_mergeable_to(const DexClass* left, const DexClass* right) {
-  always_assert(left && right);
-  if (left->get_interfaces()->empty()) {
-    return true;
+/*
+ * The most specific interfaces both `l` and `r` implement. Empty means they
+ * share none. More than one means they share several incomparable ones, so the
+ * least upper bound is an intersection type that a single DexType cannot hold;
+ * the caller must not collapse that case to Object.
+ */
+std::vector<const DexType*> find_common_interfaces(const DexType* l,
+                                                   const DexType* r) {
+  UnorderedSet<const DexType*> l_intfs;
+  // An interface is castable to itself, and `collect_interfaces` reports only
+  // what a type DECLARES. Without this the candidate set for an interface
+  // operand is empty and the intersection below is silently one-sided.
+  const auto* l_cls = type_class(l);
+  if ((l_cls != nullptr) && is_interface(l_cls)) {
+    l_intfs.insert(l);
   }
-  return is_subset(left->get_interfaces(), right->get_interfaces());
+  collect_interfaces(l, &l_intfs);
+  std::vector<const DexType*> shared;
+  for (const auto* intf : UnorderedIterable(l_intfs)) {
+    // check_cast walks r's super classes and its interface graph, so r's own
+    // set does not need collecting.
+    if (type::check_cast(r, intf)) {
+      shared.push_back(intf);
+    }
+  }
+  // Drop any candidate that a more specific candidate already implies, so that
+  // e.g. sharing both Collection and Iterable still resolves, to Collection.
+  std::vector<const DexType*> most_specific;
+  for (const auto* intf : shared) {
+    bool subsumed = false;
+    for (const auto* other : shared) {
+      if (other != intf && type::check_cast(other, intf)) {
+        subsumed = true;
+        break;
+      }
+    }
+    if (!subsumed) {
+      most_specific.push_back(intf);
+    }
+  }
+  return most_specific;
 }
 
 /*
@@ -77,27 +123,51 @@ const DexType* find_common_super_class(const DexType* l, const DexType* r) {
 const DexType* find_common_type(const DexType* l, const DexType* r) {
   const DexClass* l_cls = type_class(l);
   const DexClass* r_cls = type_class(r);
+
+  // One is interface, and the other implements it. This is answered from the
+  // implementing class alone: it names the interface in its own interface
+  // list, so the interface's own DexClass is not needed. Framework interfaces
+  // often have none -- Lorg/apache/http/HttpEntity; left the Android SDK at
+  // API 23 -- and bailing on that would send an answerable join to Top.
+  if ((r_cls != nullptr) && !is_interface(r_cls) && implements(r_cls, l)) {
+    return l;
+  }
+  if ((l_cls != nullptr) && !is_interface(l_cls) && implements(l_cls, r)) {
+    return r;
+  }
+
   if ((l_cls == nullptr) || (r_cls == nullptr)) {
     return nullptr;
   }
 
-  // One is interface, and the other implements it.
-  if (is_interface(l_cls) && !is_interface(r_cls) && implements(r_cls, l)) {
-    return l;
+  const auto* parent = find_common_super_class(l, r);
+  if ((parent == nullptr) || (type_class(parent) == nullptr)) {
+    return nullptr;
   }
-  if (is_interface(r_cls) && !is_interface(l_cls) && implements(l_cls, r)) {
-    return r;
+  if (parent != type::java_lang_Object()) {
+    return parent;
   }
 
-  const auto* parent = find_common_super_class(l, r);
-  auto* parent_cls = type_class(parent);
-  if ((parent != nullptr) && (parent_cls != nullptr)) {
-    if (are_interfaces_mergeable_to(l_cls, parent_cls) &&
-        are_interfaces_mergeable_to(r_cls, parent_cls)) {
-      return parent;
-    }
+  // Reaching Object means the super class chain found nothing, but the chain
+  // never looks at what the two operands both implement. That is often where
+  // the real answer is: three classes that all implement HttpEntity and extend
+  // Object share HttpEntity, not Object.
+  auto shared = find_common_interfaces(l, r);
+  if (shared.size() == 1) {
+    return shared.front();
   }
-  return nullptr;
+  if (!shared.empty()) {
+    // Several incomparable shared interfaces. The bound is an intersection
+    // type, so there is no single answer and Top is the honest one.
+    return nullptr;
+  }
+
+  // Nothing shared at all, so Object is genuinely the least upper bound.
+  // Reporting it only in that case is load bearing: IRTypeChecker's
+  // check_cast_helper treats Ljava/lang/Object; as an exact type and rejects
+  // it against every other target, so handing it back for a merge we simply
+  // failed to resolve turns a legal program into a type error.
+  return parent;
 }
 
 /*

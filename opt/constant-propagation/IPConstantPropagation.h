@@ -34,6 +34,9 @@ class PassImpl : public Pass {
     uint32_t big_override_threshold{5};
     UnorderedSet<const DexType*> field_blocklist;
     bool compute_definitely_assigned_ifields{true};
+    bool reduce_stringbuilder_concat{false};
+    bool merge_adjacent_constant_appends{false};
+    bool replace_constant_stringbuilder_tostring_with_const_string{false};
 
     Transform::Config transform;
     RuntimeAssertTransform::Config runtime_assert;
@@ -44,10 +47,48 @@ class PassImpl : public Pass {
     using namespace redex_properties::interactions;
     using namespace redex_properties::names;
     return {
+        {NeedsAreEqualRefReservation, Establishes},
         {DexLimitsObeyed, Preserves},
         {NoResolvablePureRefs, Preserves},
         {InitialRenameClass, Preserves},
     };
+  }
+
+  std::string get_config_doc() override {
+    return trim(R"(
+Runs the constant-propagation abstract interpretation over the whole program.
+
+#### Semantic changes in reduce_stringbuilder_concat
+
+The rewrite changes reference identity. `String.concat` returns its receiver
+when the argument is empty, where `toString()` allocated a new String, so a
+concatenation that could only have produced a new object now produces one of its
+operands:
+```java
+  String a = readName();       // "foo", not a compile-time constant
+  String s = a + "";
+  s.equals(a);                 // true, before and after
+  s == a;                      // before: false. after: true.
+```
+The old `false` is guaranteed rather than incidental: JLS 15.18.1 specifies the
+result of `+` to be a newly created String unless the expression is constant.
+Contents never differ; only identity-sensitive code can observe the change --
+`==`, `identityHashCode`, `IdentityHashMap`, a monitor held on the result, or a
+weak reference to it.
+
+#### Semantic changes in replace_constant_stringbuilder_tostring_with_const_string
+
+This rewrite changes reference identity too, observable through the same
+operations. `toString()` allocates a fresh String on every call; the
+`const-string` that takes its place resolves to the interned instance of that
+text, which is the same object every other occurrence of the literal in the
+program resolves to (JLS 3.10.5):
+```java
+  String s = new StringBuilder().append("foo").toString();
+  s.equals("foo");             // true, before and after
+  s == "foo";                  // before: false. after: true.
+```
+    )");
   }
 
   explicit PassImpl(Config config)
@@ -79,6 +120,29 @@ class PassImpl : public Pass {
          m_config.compute_definitely_assigned_ifields,
          "Whether to predict which instance fields are always written before "
          "they are read, in order to ignore the default value 0.");
+    bind("reduce_stringbuilder_concat", false,
+         m_config.reduce_stringbuilder_concat,
+         "Rewrite two-append String concatenations to String.concat: "
+         "`new StringBuilder().append(a).append(b).toString()` becomes "
+         "`a.concat(b)`, when both operands are proven non-null, because "
+         "`concat` throws on null where `append` writes the text \"null\". The "
+         "builder this orphans is only removed by a later "
+         "ObjectSensitiveDcePass "
+         "run, which is where the saving comes from. Introduces a semantic "
+         "change -- see this pass's documentation. Has no effect once InterDex "
+         "has run.");
+    bind("merge_adjacent_constant_appends", false,
+         m_config.merge_adjacent_constant_appends,
+         "Merge consecutive `StringBuilder.append(String)` calls whose "
+         "operands are all compile-time constants into a single append of the "
+         "concatenation, saving one invocation per append removed.");
+    bind("replace_constant_stringbuilder_tostring_with_const_string", false,
+         m_config.replace_constant_stringbuilder_tostring_with_const_string,
+         "Replace a StringBuilder holding one compile-time constant String "
+         "with a const-string of the string it would have produced. The "
+         "builder this orphans is only removed by a later "
+         "ObjectSensitiveDcePass run, which is where the saving comes from. "
+         "Introduces a semantic change -- see this pass's documentation.");
   }
 
   void eval_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
@@ -105,7 +169,7 @@ class PassImpl : public Pass {
                                             ApiLevelAnalyzerState*,
                                             StringAnalyzerState*,
                                             PackageNameState*,
-                                            const State&);
+                                            const NullCheckMethods&);
 
  private:
   void compute_analysis_stats(const WholeProgramState&,
@@ -116,7 +180,7 @@ class PassImpl : public Pass {
                 const XStoreRefs& xstores,
                 const FixpointIterator&,
                 const ImmutableAttributeAnalyzerState*,
-                const State& cp_state);
+                const NullCheckMethods& null_check_methods);
 
   struct Stats {
     // Number of instance fields that are known to be definitely-assigned, i.e.
@@ -139,6 +203,17 @@ class PassImpl : public Pass {
     FixpointIterator::Stats fp_iter;
   } m_stats;
   Transform::Stats m_transform_stats;
+  // Number of adjacent constant-String appends eliminated by merging.
+  size_t m_appends_merged{0};
+  // Number of toString() calls replaced by the constant string their
+  // single-append builder holds. A builder read by several toString()s counts
+  // once per call.
+  size_t m_stringbuilder_constant_tostrings_replaced{0};
+  // Number of two-append concatenations rewritten to String.concat.
+  size_t m_concat_reduced{0};
+  // Defaults to true: `run()` never sets it, and treating an unknown pipeline
+  // position as post-InterDex keeps ref-adding transformations off.
+  bool m_interdex_has_run{true};
   Config m_config;
 };
 

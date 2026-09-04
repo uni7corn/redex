@@ -7,14 +7,15 @@
 
 #include "IRAssembler.h"
 
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <sstream>
-#include <tuple>
 #include <variant>
 
 #include "Creators.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexClass.h"
 #include "DexInstruction.h"
@@ -49,7 +50,12 @@ using LabelRefs = UnorderedMap<const IRInstruction*, std::vector<std::string>>;
 reg_t reg_from_str(const std::string& reg_str) {
   always_assert(reg_str.at(0) == 'v');
   reg_t reg;
-  sscanf(&reg_str.c_str()[1], "%u", &reg);
+  const auto* first = reg_str.data() + 1;
+  const auto* last = reg_str.data() + reg_str.size();
+  auto [ptr, ec] = std::from_chars(first, last, reg);
+  always_assert_log(ec == std::errc() && ptr == last,
+                    "malformed register, expected v<uint32>: %s",
+                    reg_str.c_str());
   return reg;
 }
 
@@ -497,11 +503,10 @@ std::unique_ptr<SourceBlock> source_block_from_s_expr(const s_expr& e) {
     s_expr head;
     s_patn({s_patn(head)}, tail)
         .must_match(val_expr, "Expected 3rd and 4th arg to be a value string");
-    redex_assert(head.is_list() || head.is_nil());
-    if (head.is_nil()) {
-      break; // Should only happen first loop.
-    }
+    redex_assert(head.is_list());
     if (head.size() == 0) {
+      // `()` is a Val::none(), not a terminator: a none may sit between two
+      // defined vals, so the loop has to keep going.
       vals.emplace_back(SourceBlock::Val::none());
     } else {
       std::string val_str;
@@ -525,6 +530,34 @@ std::unique_ptr<SourceBlock> source_block_from_s_expr(const s_expr& e) {
     }
   }
   return std::make_unique<SourceBlock>(method, id, vals);
+}
+
+std::unique_ptr<Remark> remark_from_s_expr(const s_expr& e) {
+  std::string producer_raw;
+  std::string val_str_raw;
+  std::string val_int_raw;
+  s_patn({
+             s_patn(&producer_raw),
+             s_patn(&val_str_raw),
+             s_patn(&val_int_raw),
+         })
+      .must_match(e, "Expected 3 args for remark directive");
+  const auto* producer = DexString::make_string(producer_raw);
+  const auto* val_str = DexString::make_string(val_str_raw);
+  int64_t val_int = 0;
+  {
+    const auto* first = val_int_raw.data();
+    const auto* last = first + val_int_raw.size();
+    auto [ptr, ec] = std::from_chars(first, last, val_int);
+    // Reject overflow and any trailing (non-numeric) characters. from_chars
+    // has no stream-state semantics, so this is portable across libstdc++ and
+    // libc++ (unlike `in >> val_int >> std::ws`, whose sentry sets failbit at
+    // EOF on libc++).
+    always_assert_log(ec == std::errc() && ptr == last,
+                      "malformed remark val_int, expected int64: %s",
+                      val_int_raw.c_str());
+  }
+  return std::make_unique<Remark>(producer, val_str, val_int);
 }
 
 /*
@@ -707,18 +740,28 @@ s_expr create_source_block_expr(const MethodItemEntry* mie) {
   result.emplace_back(show(src->src));
   result.emplace_back(std::to_string(src->id));
 
-  std::vector<s_expr> vals;
+  // The vals are siblings of the method and id, not one nested list:
+  // source_block_from_s_expr consumes them one argument at a time.
   src->foreach_val([&](const auto& val) {
     if (val) {
-      vals.emplace_back(
+      result.emplace_back(
           std::vector<s_expr>{s_expr(std::to_string(val->val)),
                               s_expr(std::to_string(val->appear100))});
     } else {
-      vals.emplace_back();
+      result.emplace_back();
     }
   });
-  result.emplace_back(std::move(vals));
 
+  return s_expr(result);
+}
+
+s_expr create_remark_expr(const MethodItemEntry* mie) {
+  std::vector<s_expr> result;
+  result.emplace_back(".remark");
+  const Remark* remark = mie->remark.get();
+  result.emplace_back(show(remark->producer));
+  result.emplace_back(show(remark->val_str));
+  result.emplace_back(std::to_string(remark->val_int));
   return s_expr(result);
 }
 
@@ -840,6 +883,9 @@ s_expr to_s_expr(const IRCode* code) {
     case MFLOW_SOURCE_BLOCK:
       exprs.emplace_back(create_source_block_expr(&*it));
       break;
+    case MFLOW_REMARK:
+      exprs.emplace_back(create_remark_expr(&*it));
+      break;
     }
   }
 
@@ -945,6 +991,10 @@ std::unique_ptr<IRCode> ircode_from_s_expr(const s_expr& e) {
         auto src_block = source_block_from_s_expr(tail);
         always_assert(src_block != nullptr);
         code->push_back(std::move(src_block));
+      } else if (keyword == ".remark") {
+        auto remark = remark_from_s_expr(tail);
+        always_assert(remark != nullptr);
+        code->push_back(std::move(remark));
       } else if (keyword[0] == ':') {
         const auto& label = keyword;
         always_assert_log(label_defs.count(label) == 0, "Duplicate label %s",

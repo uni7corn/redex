@@ -14,6 +14,7 @@
 
 #include "ClosureAggregator.h"
 #include "ConcurrentContainers.h"
+#include "Debug.h"
 #include "InstructionLowering.h"
 #include "Lazy.h"
 #include "Liveness.h"
@@ -72,11 +73,23 @@ UnorderedSet<const ReducedEdge*> get_except_preds(
         if (reduced_components.count(pred->src) != 0u) {
           continue;
         }
+        // Decide first, then collect. The two questions are independent, and
+        // interleaving them made the answer depend on hash order: the old loop
+        // broke out on the first non-switch edge, so a pred that was going to
+        // be erased anyway still contributed the case keys of whichever of its
+        // edges happened to be visited before that one.
+        //
+        // An erased pred contributes no keys. It keeps a way into the host that
+        // does not come from the switch, so its cases are not eliminated by
+        // splitting and must not be counted as if they were.
+        if (unordered_any_of(pred->edges, [switch_block](const cfg::Edge* e) {
+              return e->src() != switch_block;
+            })) {
+          except_preds.erase(pred);
+          continue;
+        }
         for (const auto* e : UnorderedIterable(pred->edges)) {
-          if (e->src() != switch_block) {
-            except_preds.erase(pred);
-            break;
-          } else if (e->type() == cfg::EDGE_BRANCH) {
+          if (e->type() == cfg::EDGE_BRANCH) {
             except_case_keys->insert(*e->case_key());
           }
         }
@@ -317,9 +330,12 @@ std::optional<ScoredClosure> aggregate(
   for (const auto* c : switched) {
     auto expanded_preds = c->reduced_block->expand_preds(switch_block);
     always_assert(!expanded_preds.empty());
-    const auto* min_edge = *std::min_element(
-        expanded_preds.begin(), expanded_preds.end(),
-        [](auto* e, auto* f) { return e->case_key() < f->case_key(); });
+    // Any minimum will do: ties compare equal on `case_key()`, which is the
+    // only thing read off the winner.
+    const auto* min_edge =
+        *unordered_min_element(expanded_preds, [](auto* e, auto* f) {
+          return e->case_key() < f->case_key();
+        });
     if (min_edge->case_key()) {
       if (predicate(c)) {
         keyed.emplace_back(*min_edge->case_key(), c);
@@ -397,8 +413,14 @@ std::vector<ScoredClosure> get_scored_closures(const Config& config,
       [](const auto* c) { return !c->reduced_block->is_hot; },
       [](const auto* c) { return c->reduced_block->is_hot; },
       [](const auto*) { return true; }};
-  for (auto&& [switch_block, switched] :
-       UnorderedIterable(remaining_switch_case_closures)) {
+  // Visit switch blocks in id order. Each iteration can append to
+  // `scored_closures`, and that vector's order survives into emission, so
+  // iterating the map in hash order would let the addresses of the switch
+  // blocks decide the order candidates are considered in.
+  for (auto* switch_block : unordered_to_ordered_keys(
+           remaining_switch_case_closures,
+           [](cfg::Block* a, cfg::Block* b) { return a->id() < b->id(); })) {
+    const auto& switched = remaining_switch_case_closures.at(switch_block);
     auto is_large_packed_switch =
         is_large(config, switch_block) && is_packed(switch_block);
     for (const auto& predicate : predicates) {
@@ -419,7 +441,10 @@ std::vector<ScoredClosure> get_scored_closures(const Config& config,
 std::vector<SplittableClosure> to_splittable_closures(
     size_t max_live_in,
     const std::shared_ptr<MethodClosures>& mcs,
-    std::vector<ScoredClosure> scored_closures) {
+    std::vector<ScoredClosure> scored_closures,
+    // Both null on the top-level-switch path, which has no store context.
+    const RefChecker* ref_checker,
+    std::atomic<size_t>* arg_type_illegal) {
   std::vector<SplittableClosure> splittable_closures;
   // We sort closures in a way that allows us to quickly prune contained
   // closures if we found a viable containing closure.
@@ -468,7 +493,8 @@ std::vector<SplittableClosure> to_splittable_closures(
   UnorderedSet<const ReducedBlock*> covered;
   std::erase_if(scored_closures, [&covered, &ota, &liveness_fp_iter,
                                   &uninitialized_objects, &insns, &def_uses,
-                                  max_live_in](auto& sc) {
+                                  max_live_in, ref_checker,
+                                  arg_type_illegal](auto& sc) {
     for (auto* c : sc.closures) {
       if (covered.count(c->reduced_block)) {
         // We already have this contained closure covered by a valid
@@ -503,7 +529,8 @@ std::vector<SplittableClosure> to_splittable_closures(
     std::sort(ordered_live_in.begin(), ordered_live_in.end());
 
     ReducedCFGClosureAdapter rcfgca(*ota, first_insn, insns,
-                                    sc.reduced_components, def_uses);
+                                    sc.reduced_components, def_uses,
+                                    /*exclude_in_cover_seed_defs=*/false);
     for (auto reg : ordered_live_in) {
       auto defs = rcfgca.get_defs(reg);
       if (defs.size() == 1 && opcode::is_a_const((*defs.begin())->opcode())) {
@@ -512,6 +539,14 @@ std::vector<SplittableClosure> to_splittable_closures(
       }
       const auto* type = ota->get_type_demand(rcfgca, reg);
       if (!type) {
+        return true;
+      }
+      // The type demand is a meet over the uses, so it can name a type that no
+      // individual use named -- possibly an external one above the min-sdk
+      // floor, which type-checks at build time and fails to resolve on an old
+      // device.
+      if (ref_checker != nullptr && !ref_checker->check_type(type)) {
+        ++*arg_type_illegal;
         return true;
       }
       sc.args.push_back((ClosureArgument){reg, type, nullptr});
@@ -557,7 +592,10 @@ std::vector<SplittableClosure> to_splittable_closures(
         oss << "B" << b->id() << ", ";
       }
       oss << "reaches ";
-      for (const auto* other : UnorderedIterable(reachable)) {
+      for (const auto* other : unordered_to_ordered(
+               reachable, [](const ReducedBlock* x, const ReducedBlock* y) {
+                 return x->id < y->id;
+               })) {
         oss << "R" << other->id << ", ";
       }
       oss << "\n";
@@ -579,6 +617,18 @@ std::vector<SplittableClosure> to_splittable_closures(
 } // namespace
 
 namespace method_splitting_impl {
+
+StoreRefCheckers::StoreRefCheckers(const DexStoresVector& stores,
+                                   bool normal_primary_dex,
+                                   const api::AndroidSDK* min_sdk_api)
+    : m_xstores(stores, normal_primary_dex) {
+  m_ref_checkers.reserve(m_xstores.store_count());
+  for (size_t store_idx = 0; store_idx < m_xstores.store_count(); store_idx++) {
+    m_ref_checkers.push_back(
+        std::make_unique<RefChecker>(&m_xstores, store_idx, min_sdk_api));
+  }
+}
+
 std::vector<const DexType*> SplittableClosure::get_arg_types() const {
   std::vector<const DexType*> arg_types;
   for (auto arg : args) {
@@ -593,14 +643,17 @@ ConcurrentMap<DexType*, std::vector<SplittableClosure>>
 select_splittable_closures_based_on_costs(
     const ConcurrentSet<DexMethod*>& methods,
     const Config& config,
+    const StoreRefCheckers& store_ref_checkers,
     InsertOnlyConcurrentSet<const DexMethod*>* concurrent_hot_methods,
     InsertOnlyConcurrentMap<DexMethod*, size_t>*
-        concurrent_splittable_no_optimizations_methods) {
+        concurrent_splittable_no_optimizations_methods,
+    std::atomic<size_t>* arg_type_illegal) {
   Timer t("select_splittable_closures_based_on_costs");
   ConcurrentMap<DexType*, std::vector<SplittableClosure>>
       concurrent_splittable_closures;
   auto concurrent_process_method = [&](DexMethod* method) {
-    auto rcfg = reduce_cfg(method, config.split_block_size);
+    normalize_cfg_for_splitting(method, config.split_block_size);
+    auto rcfg = reduce_cfg(method);
     auto is_sufficiently_large = [&]() {
       if (rcfg->code_size() >= config.min_original_size) {
         return true;
@@ -655,7 +708,8 @@ select_splittable_closures_based_on_costs(
       return;
     }
     auto splittable_closures = to_splittable_closures(
-        config.max_live_in, mcs, std::move(scored_closures));
+        config.max_live_in, mcs, std::move(scored_closures),
+        &store_ref_checkers.get(method->get_class()), arg_type_illegal);
     concurrent_splittable_closures.update(
         method->get_class(), [&](auto, auto& v, bool) {
           v.insert(v.end(),
@@ -680,6 +734,7 @@ select_splittable_closures_from_top_level_switch_cases(
     }
 
     auto& cfg = method->get_code()->cfg();
+    normalize_cfg_for_splitting(method);
     auto rcfg = reduce_cfg(method);
 
     auto mcs = discover_closures(method, std::move(rcfg));
@@ -716,7 +771,9 @@ select_splittable_closures_from_top_level_switch_cases(
       scored_closures.emplace_back(std::move(sc));
     }
     auto splittable_closures =
-        to_splittable_closures(max_live_in, mcs, std::move(scored_closures));
+        to_splittable_closures(max_live_in, mcs, std::move(scored_closures),
+                               /* ref_checker */ nullptr,
+                               /* arg_type_illegal */ nullptr);
     if (!splittable_closures.empty()) {
       concurrent_splittable_closures.emplace(method,
                                              std::move(splittable_closures));

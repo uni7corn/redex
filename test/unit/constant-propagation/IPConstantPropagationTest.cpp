@@ -9,12 +9,12 @@
 
 #include <signal.h>
 
+#include <boost/algorithm/string/replace.hpp>
 #include <gtest/gtest.h>
 
 #include "ConfigFiles.h"
 #include "ConstantPropagationRuntimeAssert.h"
 #include "Creators.h"
-#include "Debug.h"
 #include "DebugUtils.h"
 #include "DexUtil.h"
 #include "IPConstantPropagationAnalysis.h"
@@ -57,7 +57,7 @@ struct InterproceduralConstantPropagationTest : public RedexTest {
   StringAnalyzerState m_string_analyzer_state{
       constant_propagation::StringAnalyzerState::make_default()};
   PackageNameState m_package_name_state{PackageNameState::make(package_name)};
-  State m_cp_state;
+  NullCheckMethods m_null_check_methods;
   ConfigFiles conf = ConfigFiles(Json::nullValue);
 };
 
@@ -174,6 +174,79 @@ TEST_F(InterproceduralConstantPropagationTest, constantArgumentClass) {
   )");
   m2->get_code()->clear_cfg();
   EXPECT_CODE_EQ(m2->get_code(), expected_code2.get());
+}
+
+// The caller passes callee the constant "" (a String), but only on a path
+// guarded by a check-cast to Item that always throws (a String is never an
+// Item):
+//   (const-string "")
+//   (move-result-pseudo-object v1)
+//   (check-cast v1 "LItem;")  ; always throws
+//   (invoke-direct (v0 v1) "LFoo;.callee:(LItem;)V")  ; unreachable
+//
+// callee thus has no reachable call and must be left unchanged. If IPCP took
+// v1 == "" as callee's argument, it would materialize that constant over
+// callee's Item parameter, producing an ill-typed body:
+//   (const-string "")
+//   (move-result-pseudo-object v1)  ; v1 is now a String, not an Item
+//   (iput-object v1 v0 "LFoo;.item:LItem;")  ; String into an Item field
+// which the type checker rejects.
+TEST_F(InterproceduralConstantPropagationTest,
+       provablyFailingCheckCastNotFoldedIntoCallee) {
+  Scope scope;
+  auto* item_ty = DexType::make_type("LItem;");
+  ClassCreator item_creator(item_ty);
+  item_creator.set_super(type::java_lang_Object());
+  scope.push_back(item_creator.create());
+
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+  auto* field =
+      dynamic_cast<DexField*>(DexField::make_field("LFoo;.item:LItem;"));
+  field->make_concrete(ACC_PUBLIC);
+  creator.add_field(field);
+
+  auto* m1 = assembler::method_from_string(R"(
+    (method (public) "LFoo;.caller:()V"
+     (
+      (load-param-object v0)
+      (const-string "")
+      (move-result-pseudo-object v1)
+      (check-cast v1 "LItem;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v0 v1) "LFoo;.callee:(LItem;)V")
+      (return-void)
+     )
+    )
+  )");
+  m1->rstate.set_root();
+  creator.add_method(m1);
+  m1->get_code()->build_cfg();
+
+  const auto* callee_str = R"(
+    (
+     (load-param-object v0)
+     (load-param-object v1)
+     (iput-object v1 v0 "LFoo;.item:LItem;")
+     (return-void)
+    )
+  )";
+  auto* m2 = DexMethod::make_method("LFoo;.callee:(LItem;)V")
+                 ->make_concrete(ACC_PRIVATE,
+                                 assembler::ircode_from_string(callee_str),
+                                 /* is_virtual */ false);
+  creator.add_method(m2);
+  m2->get_code()->build_cfg();
+  scope.push_back(creator.create());
+
+  InterproceduralConstantPropagationPass().run(make_simple_stores(scope), conf);
+
+  // Only callee is checked, not the caller: IPCP finds the caller's path dead
+  // but leaves deleting it to DCE, which this unit test does not run.
+  m2->get_code()->clear_cfg();
+  auto expected_code = assembler::ircode_from_string(callee_str);
+  EXPECT_CODE_EQ(m2->get_code(), expected_code.get());
 }
 
 TEST_F(InterproceduralConstantPropagationTest, constantArgumentClassXStore) {
@@ -427,6 +500,637 @@ TEST_F(InterproceduralConstantPropagationTest, argumentsGreaterThanZero) {
   EXPECT_CODE_EQ(m3->get_code(), expected_code3.get());
 }
 
+// Body templates filled per case via {ACCESS}/{SIG}/{INVOKE}.
+constexpr std::string_view kParamSummaryDerefTemplate = R"(
+    (method ({ACCESS}) "LFoo;.deref:{SIG}"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-virtual (v1) "Ljava/lang/Object;.hashCode:()I")
+      (return-void)
+     )
+    )
+  )";
+
+constexpr std::string_view kParamSummaryCallerTemplate = R"(
+    (method (public static) "LFoo;.caller:(LFoo;LFoo;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      ({INVOKE} (v0 v1) "LFoo;.deref:{SIG}")
+      (if-eqz v1 :null)
+      (const v2 1)
+      (return-void)
+      (:null)
+      (const v2 0)
+      (return-void)
+     )
+    )
+  )";
+
+constexpr std::string_view kParamSummaryExpectedTemplate = R"(
+    (
+     (load-param-object v0)
+     (load-param-object v1)
+     ({INVOKE} (v0 v1) "LFoo;.deref:{SIG}")
+     (const v2 1)
+     (return-void)
+    )
+  )";
+
+struct ParamSummaryCase {
+  std::string name;
+  std::string callee_access;
+  std::string callee_descriptor;
+  std::string invoke;
+};
+
+class InterproceduralConstantPropagationParamSummaryTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<std::tuple<ParamSummaryCase, bool>> {
+ protected:
+  std::string fill(std::string_view tmpl) {
+    const auto& test_case = std::get<0>(GetParam());
+    std::string s(tmpl);
+    boost::replace_all(s, "{ACCESS}", test_case.callee_access);
+    boost::replace_all(s, "{SIG}", test_case.callee_descriptor);
+    boost::replace_all(s, "{INVOKE}", test_case.invoke);
+    return s;
+  }
+};
+
+// A callee that dereferences its parameter records a non-null per-parameter
+// exit-value summary, so on the call's no-throw edge the caller's redundant
+// null check on that argument folds away.
+TEST_P(InterproceduralConstantPropagationParamSummaryTest,
+       propagateRedundantArgNullCheck) {
+  const bool use_call_graph = std::get<1>(GetParam());
+
+  Scope scope;
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  auto* deref = assembler::method_from_string(fill(kParamSummaryDerefTemplate));
+  creator.add_method(deref);
+  deref->get_code()->build_cfg();
+
+  auto* caller =
+      assembler::method_from_string(fill(kParamSummaryCallerTemplate));
+  caller->rstate.set_root();
+  creator.add_method(caller);
+  caller->get_code()->build_cfg();
+
+  scope.push_back(creator.create());
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  config.use_multiple_callee_callgraph = use_call_graph;
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  auto expected_caller =
+      assembler::ircode_from_string(fill(kParamSummaryExpectedTemplate));
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_caller.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InterproceduralConstantPropagationParamSummaryTests,
+    InterproceduralConstantPropagationParamSummaryTest,
+    ::testing::Combine(::testing::Values(
+                           // Extra unused leading param so the dereferenced arg
+                           // is v1, as it is for the instance callees (whose v0
+                           // is the implicit `this`).
+                           ParamSummaryCase{"invoke_static", "private static",
+                                            "(LFoo;LFoo;)V", "invoke-static"},
+                           ParamSummaryCase{"invoke_direct", "private",
+                                            "(LFoo;)V", "invoke-direct"},
+                           ParamSummaryCase{"invoke_virtual_final",
+                                            "public final", "(LFoo;)V",
+                                            "invoke-virtual"}),
+                       ::testing::Bool()),
+    [](const auto& info) {
+      return std::get<0>(info.param).name +
+             (std::get<1>(info.param) ? "_with_call_graph" : "_no_call_graph");
+    });
+
+// invoke-super is statically dispatched, so it refines the caller's argument in
+// either call-graph mode.
+class InterproceduralConstantPropagationSuperSummaryTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<bool> {};
+
+TEST_P(InterproceduralConstantPropagationSuperSummaryTest,
+       propagateRedundantArgNullCheckViaSuper) {
+  auto* base_ty = DexType::make_type("LBase;");
+  ClassCreator base_creator(base_ty);
+  base_creator.set_super(type::java_lang_Object());
+  auto* deref = assembler::method_from_string(R"(
+    (method (public) "LBase;.deref:(LBase;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-virtual (v1) "Ljava/lang/Object;.hashCode:()I")
+      (return-void)
+     )
+    )
+  )");
+  base_creator.add_method(deref);
+  deref->get_code()->build_cfg();
+
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(base_ty);
+  auto* caller = assembler::method_from_string(R"(
+    (method (public) "LFoo;.caller:(LBase;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-super (v0 v1) "LBase;.deref:(LBase;)V")
+      (if-eqz v1 :null)
+      (const v2 1)
+      (return-void)
+      (:null)
+      (const v2 0)
+      (return-void)
+     )
+    )
+  )");
+  caller->rstate.set_root();
+  creator.add_method(caller);
+  caller->get_code()->build_cfg();
+
+  Scope scope;
+  scope.push_back(base_creator.create());
+  scope.push_back(creator.create());
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  config.use_multiple_callee_callgraph = GetParam();
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  auto expected_caller = assembler::ircode_from_string(R"(
+    (
+     (load-param-object v0)
+     (load-param-object v1)
+     (invoke-super (v0 v1) "LBase;.deref:(LBase;)V")
+     (const v2 1)
+     (return-void)
+    )
+  )");
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_caller.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(InterproceduralConstantPropagationSuperSummaryTests,
+                         InterproceduralConstantPropagationSuperSummaryTest,
+                         ::testing::Bool(),
+                         [](const auto& info) {
+                           return info.param ? "with_call_graph"
+                                             : "no_call_graph";
+                         });
+
+// Per-parameter exit-value summary for a PRIMITIVE (int) parameter: bound(x)
+// throws when x is negative, so on the call's no-throw edge x is known to be
+// >= 0 and the caller's redundant `if (x < 0)` is eliminated -- the primitive
+// analog of propagateRedundantArgNullCheck's object non-null fact, exercised
+// with and without the multiple-callee call graph.
+class InterproceduralConstantPropagationPrimitiveBoundTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<bool> {};
+
+TEST_P(InterproceduralConstantPropagationPrimitiveBoundTest,
+       propagateRedundantPrimitiveBoundCheck) {
+  Scope scope;
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  auto* bound = assembler::method_from_string(R"(
+    (method (private static) "LFoo;.bound:(I)V"
+     (
+      (load-param v0)
+      (if-ltz v0 :neg)
+      (return-void)
+      (:neg)
+      (new-instance "Ljava/lang/IllegalArgumentException;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1) "Ljava/lang/IllegalArgumentException;.<init>:()V")
+      (throw v1)
+     )
+    )
+  )");
+  creator.add_method(bound);
+  bound->get_code()->build_cfg();
+
+  auto* caller = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.caller:(I)V"
+     (
+      (load-param v0)
+      (invoke-static (v0) "LFoo;.bound:(I)V")
+      (if-ltz v0 :neg)
+      (const v1 1)
+      (return-void)
+      (:neg)
+      (const v1 0)
+      (return-void)
+     )
+    )
+  )");
+  caller->rstate.set_root();
+  creator.add_method(caller);
+  caller->get_code()->build_cfg();
+
+  scope.push_back(creator.create());
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  config.use_multiple_callee_callgraph = GetParam();
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  auto expected_caller = assembler::ircode_from_string(R"(
+    (
+     (load-param v0)
+     (invoke-static (v0) "LFoo;.bound:(I)V")
+     (const v1 1)
+     (return-void)
+    )
+  )");
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_caller.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(InterproceduralConstantPropagationPrimitiveBoundTests,
+                         InterproceduralConstantPropagationPrimitiveBoundTest,
+                         ::testing::Bool(),
+                         [](const auto& info) {
+                           return info.param ? "with_call_graph"
+                                             : "no_call_graph";
+                         });
+
+// Soundness check for the param-non-null summary: a method that reassigns its
+// param register inside the body must NOT contribute a "param non-null"
+// fact, even if the register holds a non-null value at every normal exit.
+// Otherwise the caller would falsely conclude its argument was non-null.
+TEST_F(InterproceduralConstantPropagationTest,
+       paramNonNullSummaryUnstableRegistersDoNotPropagateParam) {
+  Scope scope;
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  // Reassigns its param register: when the arg is null on entry, v0 is
+  // overwritten with a non-null string, so v0 is non-null at every exit even
+  // though the entry value (what the caller passed) may have been null.
+  auto* normalize = assembler::method_from_string(R"(
+    (method (private static) "LFoo;.unstableNormalize:(Ljava/lang/Object;)V"
+     (
+      (load-param-object v0)
+      (if-nez v0 :ok)
+      (const-string "x")
+      (move-result-pseudo-object v0)
+      (:ok)
+      (return-void)
+     )
+    )
+  )");
+  creator.add_method(normalize);
+  normalize->get_code()->build_cfg();
+
+  const std::string caller_body = R"((
+      (load-param-object v0)
+      (invoke-static (v0) "LFoo;.unstableNormalize:(Ljava/lang/Object;)V")
+      (if-eqz v0 :null)
+      (const v1 1)
+      (return-void)
+      (:null)
+      (const v1 0)
+      (return-void)
+    ))";
+  auto* caller = assembler::method_from_string(
+      R"((method (public static) "LFoo;.caller:(Ljava/lang/Object;)V" )" +
+      caller_body + ")");
+  caller->rstate.set_root();
+  creator.add_method(caller);
+  caller->get_code()->build_cfg();
+
+  auto* cls = creator.create();
+  scope.push_back(cls);
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  auto expected_code = assembler::ircode_from_string(caller_body);
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_code.get());
+}
+
+// Two-level transitive param-env propagation needs the second WPS iteration:
+// deref(p) dereferences p ({0 -> NEZ}); wrapper(p) only forwards to deref(p),
+// so it picks up {0 -> NEZ} only on the iteration after deref's summary exists.
+// With one iteration the caller's `if-eqz p` survives (sanity that the second
+// iteration is load-bearing); with two it is pruned.
+struct TransitiveIterationCase {
+  std::string name;
+  size_t iterations;
+  bool prunes_null_check;
+};
+
+class InterproceduralConstantPropagationTransitiveSummaryTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<TransitiveIterationCase> {};
+
+TEST_P(InterproceduralConstantPropagationTransitiveSummaryTest,
+       propagatesParamThroughWrapper) {
+  const auto& test_case = GetParam();
+  Scope scope;
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  auto* deref = assembler::method_from_string(R"(
+    (method (private static) "LFoo;.deref:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (invoke-virtual (v0) "Ljava/lang/Object;.hashCode:()I")
+      (return-void)
+     )
+    )
+  )");
+  creator.add_method(deref);
+  deref->get_code()->build_cfg();
+
+  auto* wrapper = assembler::method_from_string(R"(
+    (method (private static) "LFoo;.wrapper:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (invoke-static (v0) "LFoo;.deref:(LFoo;)V")
+      (return-void)
+     )
+    )
+  )");
+  creator.add_method(wrapper);
+  wrapper->get_code()->build_cfg();
+
+  const std::string caller_body = R"((
+      (load-param-object v0)
+      (invoke-static (v0) "LFoo;.wrapper:(LFoo;)V")
+      (if-eqz v0 :null)
+      (const v1 1)
+      (return-void)
+      (:null)
+      (const v1 0)
+      (return-void)
+    ))";
+  auto* caller = assembler::method_from_string(
+      R"((method (public static) "LFoo;.caller:(LFoo;)V" )" + caller_body +
+      ")");
+  caller->rstate.set_root();
+  creator.add_method(caller);
+  caller->get_code()->build_cfg();
+
+  auto* cls = creator.create();
+  scope.push_back(cls);
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = test_case.iterations;
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  const std::string pruned_body = R"((
+      (load-param-object v0)
+      (invoke-static (v0) "LFoo;.wrapper:(LFoo;)V")
+      (const v1 1)
+      (return-void)
+    ))";
+  auto expected_code = assembler::ircode_from_string(
+      test_case.prunes_null_check ? pruned_body : caller_body);
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_code.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InterproceduralConstantPropagationTransitiveSummaryTests,
+    InterproceduralConstantPropagationTransitiveSummaryTest,
+    ::testing::Values(
+        TransitiveIterationCase{"sanity_one_iteration_keeps_null_check", 1,
+                                false},
+        TransitiveIterationCase{"two_iterations_prune_null_check", 2, true}),
+    [](const auto& info) { return info.param.name; });
+
+// An overridable (true-virtual) callee must NOT be refined in either call-graph
+// mode: a subclass override need not enforce the param's precondition.
+class InterproceduralConstantPropagationOverridableVirtualTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<bool> {};
+
+TEST_P(InterproceduralConstantPropagationOverridableVirtualTest,
+       paramOverridableVirtualNotRefined) {
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  auto* cls_child_ty = DexType::make_type("LBoo;");
+  ClassCreator child_creator(cls_child_ty);
+  child_creator.set_super(cls_ty);
+
+  auto* deref = assembler::method_from_string(R"(
+    (method (public) "LFoo;.deref:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-virtual (v1) "Ljava/lang/Object;.hashCode:()I")
+      (return-void)
+     )
+    )
+  )");
+  creator.add_method(deref);
+
+  const std::string caller_body = R"((
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-virtual (v0 v1) "LFoo;.deref:(LFoo;)V")
+      (if-eqz v1 :null)
+      (const v2 1)
+      (return-void)
+      (:null)
+      (const v2 0)
+      (return-void)
+    ))";
+  auto* caller = assembler::method_from_string(
+      R"((method (public static) "LFoo;.caller:(LFoo;LFoo;)V" )" + caller_body +
+      ")");
+  caller->rstate.set_root();
+  creator.add_method(caller);
+
+  // Override that does not dereference the param. Its presence makes
+  // LFoo;.deref a true virtual.
+  auto* child_deref = assembler::method_from_string(R"(
+    (method (public) "LBoo;.deref:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (return-void)
+     )
+    )
+  )");
+  child_creator.add_method(child_deref);
+
+  DexStore store("classes");
+  store.add_classes({creator.create()});
+  store.add_classes({child_creator.create()});
+  std::vector<DexStore> stores;
+  stores.emplace_back(std::move(store));
+  auto scope = build_class_scope(stores);
+  walk::code(scope, [](DexMethod*, IRCode& code) { code.build_cfg(); });
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  config.use_multiple_callee_callgraph = GetParam();
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  // The caller's null check must survive in both call-graph modes.
+  auto expected_code = assembler::ircode_from_string(caller_body);
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_code.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InterproceduralConstantPropagationOverridableVirtualTests,
+    InterproceduralConstantPropagationOverridableVirtualTest,
+    ::testing::Bool(),
+    [](const auto& info) {
+      return info.param ? "with_call_graph" : "no_call_graph";
+    });
+
+// invoke-interface is refined only when the call graph resolves a monomorphic
+// callsite -- it is not whitelisted otherwise, and a polymorphic join is top.
+struct InterfaceSummaryCase {
+  std::string name;
+  bool monomorphic;
+  bool use_call_graph;
+  bool expects_refined;
+};
+
+class InterproceduralConstantPropagationInterfaceSummaryTest
+    : public InterproceduralConstantPropagationTest,
+      public ::testing::WithParamInterface<InterfaceSummaryCase> {};
+
+TEST_P(InterproceduralConstantPropagationInterfaceSummaryTest,
+       refinesInterfaceArgOnlyWhenMonomorphicWithCallGraph) {
+  const auto& test_case = GetParam();
+
+  auto* iface_ty = DexType::make_type("LIface;");
+  ClassCreator iface_creator(iface_ty);
+  iface_creator.set_super(type::java_lang_Object());
+  iface_creator.set_access(iface_creator.get_access() | ACC_INTERFACE |
+                           ACC_ABSTRACT);
+  auto* iface_deref =
+      DexMethod::make_method("LIface;.deref:(Ljava/lang/Object;)V")
+          ->make_concrete(ACC_PUBLIC | ACC_ABSTRACT, /*is_virtual=*/true);
+  iface_creator.add_method(iface_deref);
+
+  Scope scope;
+  scope.push_back(iface_creator.create());
+
+  // LImpl1;.deref dereferences the arg, recording {1 -> NEZ}.
+  auto* impl1_ty = DexType::make_type("LImpl1;");
+  ClassCreator impl1_creator(impl1_ty);
+  impl1_creator.set_super(type::java_lang_Object());
+  impl1_creator.add_interface(iface_ty);
+  auto* impl1_deref = assembler::method_from_string(R"(
+    (method (public) "LImpl1;.deref:(Ljava/lang/Object;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-virtual (v1) "Ljava/lang/Object;.hashCode:()I")
+      (return-void)
+     )
+    )
+  )");
+  impl1_creator.add_method(impl1_deref);
+  impl1_deref->get_code()->build_cfg();
+  scope.push_back(impl1_creator.create());
+
+  // A second implementor whose deref leaves the arg untouched makes the
+  // callsite polymorphic, so the joined summary for the arg is top.
+  if (!test_case.monomorphic) {
+    auto* impl2_ty = DexType::make_type("LImpl2;");
+    ClassCreator impl2_creator(impl2_ty);
+    impl2_creator.set_super(type::java_lang_Object());
+    impl2_creator.add_interface(iface_ty);
+    auto* impl2_deref = assembler::method_from_string(R"(
+      (method (public) "LImpl2;.deref:(Ljava/lang/Object;)V"
+       (
+        (load-param-object v0)
+        (load-param-object v1)
+        (return-void)
+       )
+      )
+    )");
+    impl2_creator.add_method(impl2_deref);
+    impl2_deref->get_code()->build_cfg();
+    scope.push_back(impl2_creator.create());
+  }
+
+  auto* caller_ty = DexType::make_type("LCaller;");
+  ClassCreator caller_creator(caller_ty);
+  caller_creator.set_super(type::java_lang_Object());
+  const std::string caller_body = R"((
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-interface (v0 v1) "LIface;.deref:(Ljava/lang/Object;)V")
+      (if-eqz v1 :null)
+      (const v2 1)
+      (return-void)
+      (:null)
+      (const v2 0)
+      (return-void)
+    ))";
+  auto* caller = assembler::method_from_string(
+      R"((method (public static) "LCaller;.caller:(LIface;Ljava/lang/Object;)V" )" +
+      caller_body + ")");
+  caller->rstate.set_root();
+  caller_creator.add_method(caller);
+  caller->get_code()->build_cfg();
+  scope.push_back(caller_creator.create());
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 1;
+  config.use_multiple_callee_callgraph = test_case.use_call_graph;
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  const std::string pruned_body = R"((
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-interface (v0 v1) "LIface;.deref:(Ljava/lang/Object;)V")
+      (const v2 1)
+      (return-void)
+    ))";
+  auto expected_code = assembler::ircode_from_string(
+      test_case.expects_refined ? pruned_body : caller_body);
+  caller->get_code()->clear_cfg();
+  EXPECT_CODE_EQ(caller->get_code(), expected_code.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InterproceduralConstantPropagationInterfaceSummaryTests,
+    InterproceduralConstantPropagationInterfaceSummaryTest,
+    ::testing::Values(
+        InterfaceSummaryCase{"monomorphic_no_call_graph", true, false, false},
+        InterfaceSummaryCase{"monomorphic_with_call_graph", true, true, true},
+        InterfaceSummaryCase{"polymorphic_no_call_graph", false, false, false},
+        InterfaceSummaryCase{"polymorphic_with_call_graph", false, true,
+                             false}),
+    [](const auto& info) { return info.param.name; });
+
 // We had a bug where an invoke instruction inside an unreachable block of code
 // would cause the whole IPCP domain to be set to bottom. This test checks that
 // we handle it correctly.
@@ -477,16 +1181,16 @@ TEST_F(InterproceduralConstantPropagationTest, unreachableInvoke) {
   auto cg = std::make_shared<call_graph::Graph>(call_graph::single_callee_graph(
       *method_override_graph::build_graph(scope), scope));
   walk::code(scope, [](DexMethod*, IRCode& code) { code.build_cfg(); });
-  State cp_state;
+  NullCheckMethods null_check_methods;
   FixpointIterator fp_iter(std::move(cg),
-                           [&cp_state](const DexMethod* method,
-                                       const WholeProgramState&,
-                                       const ArgumentDomain& args) {
+                           [&null_check_methods](const DexMethod* method,
+                                                 const WholeProgramState&,
+                                                 const ArgumentDomain& args) {
                              const auto& code = *method->get_code();
                              auto env = env_with_params(is_static(method),
                                                         &code, args);
                              return std::make_unique<IntraproceduralAnalysis>(
-                                 &cp_state,
+                                 &null_check_methods,
                                  /* wps accessor */ nullptr,
                                  code.cfg(),
                                  ConstantPrimitiveAnalyzer(),
@@ -546,8 +1250,8 @@ TEST_F(RuntimeAssertTest, RuntimeAssertEquality) {
   RuntimeAssertTransform rat(m_config.runtime_assert);
   auto* code = method->get_code();
   code->build_cfg();
-  intraprocedural::FixpointIterator intra_cp(
-      /* cp_state */ nullptr, code->cfg(), ConstantPrimitiveAnalyzer());
+  intraprocedural::FixpointIterator intra_cp(code->cfg(),
+                                             ConstantPrimitiveAnalyzer());
   intra_cp.run(env);
   rat.apply(intra_cp, WholeProgramState(), method);
 
@@ -584,8 +1288,8 @@ TEST_F(RuntimeAssertTest, RuntimeAssertSign) {
   RuntimeAssertTransform rat(m_config.runtime_assert);
   auto* code = method->get_code();
   code->build_cfg();
-  intraprocedural::FixpointIterator intra_cp(
-      /* cp_state */ nullptr, code->cfg(), ConstantPrimitiveAnalyzer());
+  intraprocedural::FixpointIterator intra_cp(code->cfg(),
+                                             ConstantPrimitiveAnalyzer());
   intra_cp.run(env);
   EXPECT_TRUE(method->get_code()->cfg_built());
   rat.apply(intra_cp, WholeProgramState(), method);
@@ -627,8 +1331,8 @@ TEST_F(RuntimeAssertTest, RuntimeAssertCheckIntOnly) {
   RuntimeAssertTransform rat(m_config.runtime_assert);
   auto* code = method->get_code();
   code->build_cfg();
-  intraprocedural::FixpointIterator intra_cp(
-      /* cp_state */ nullptr, code->cfg(), ConstantPrimitiveAnalyzer());
+  intraprocedural::FixpointIterator intra_cp(code->cfg(),
+                                             ConstantPrimitiveAnalyzer());
   intra_cp.run(env);
   rat.apply(intra_cp, WholeProgramState(), method);
 
@@ -664,8 +1368,8 @@ TEST_F(RuntimeAssertTest, RuntimeAssertCheckVirtualMethod) {
   RuntimeAssertTransform rat(m_config.runtime_assert);
   auto* code = method->get_code();
   code->build_cfg();
-  intraprocedural::FixpointIterator intra_cp(
-      /* cp_state */ nullptr, code->cfg(), ConstantPrimitiveAnalyzer());
+  intraprocedural::FixpointIterator intra_cp(code->cfg(),
+                                             ConstantPrimitiveAnalyzer());
   intra_cp.run(env);
   rat.apply(intra_cp, WholeProgramState(), method);
 
@@ -1100,7 +1804,7 @@ TEST_F(InterproceduralConstantPropagationTest, constantFieldAfterClinit) {
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   EXPECT_EQ(wps.get_field_value(field_qux), SignedConstantDomain(0));
   EXPECT_EQ(wps.get_field_value(field_corge), SignedConstantDomain(1));
@@ -1194,7 +1898,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   EXPECT_EQ(wps.get_field_value(field_qux), ConstantValue::top());
 
@@ -1693,7 +2397,7 @@ TEST_F(InterproceduralConstantPropagationTest, whiteBoxReturnValues) {
   config.max_heap_analysis_iterations = 1;
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
 
   // Make sure we mark methods that have a reachable return-void statement as
@@ -1730,7 +2434,7 @@ TEST_F(InterproceduralConstantPropagationTest, min_sdk) {
   config.max_heap_analysis_iterations = 1;
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
 
   // Make sure we mark methods that have a reachable return-void statement as
@@ -1844,7 +2548,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // as the field is definitely-assigned, 0 was not added to the numeric
   // interval domain
@@ -1862,6 +2566,71 @@ TEST_F(InterproceduralConstantPropagationTest,
   )");
   m->get_code()->clear_cfg();
   EXPECT_CODE_EQ(m->get_code(), expected_code.get());
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       nezConstantFieldAfterInit_transient_field_not_inferred) {
+  // Like nezConstantFieldAfterInit_simple, but the field is transient, so it
+  // may be null/0 after deserialization and IPCP must not infer its value.
+  auto* cls_ty = DexType::make_type("LFoo;");
+  ClassCreator creator(cls_ty);
+  creator.set_super(type::java_lang_Object());
+
+  auto* field_f = DexField::make_field("LFoo;.f:I")
+                      ->make_concrete(ACC_PUBLIC | ACC_TRANSIENT);
+  creator.add_field(field_f);
+
+  auto* init = assembler::method_from_string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (const v1 42)
+      (iput v1 v0 "LFoo;.f:I")
+      (return-void)
+     )
+    )
+  )");
+  init->rstate.set_root(); // Make this an entry point
+  creator.add_method(init);
+
+  auto* m = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.baz:(LFoo;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v0)
+      (return v0)
+     )
+    )
+  )");
+  m->rstate.set_root(); // Make this an entry point
+  creator.add_method(m);
+
+  Scope scope{creator.create()};
+
+  // Capture baz's IR to assert IPCP leaves it unchanged (it reads the field).
+  auto expected = assembler::to_s_expr(m->get_code());
+
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg();
+    code.cfg().calculate_exit_block();
+  });
+
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 2;
+
+  auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
+      scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
+  const auto& wps = fp_iter->get_whole_program_state();
+  EXPECT_TRUE(wps.get_field_value(field_f).is_top());
+
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+
+  m->get_code()->clear_cfg();
+  EXPECT_EQ(assembler::to_s_expr(m->get_code()), expected);
 }
 
 TEST_F(InterproceduralConstantPropagationTest,
@@ -1921,7 +2690,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // as the field is definitely-assigned, even with the branching in the
   // constructor, 0 was not added to the numeric interval domain
@@ -1992,7 +2761,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // 0 is included in the numeric interval as 'this' escaped before the
   // assignment
@@ -2061,7 +2830,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // 0 is included in the numeric interval as 'this' escaped before the
   // assignment
@@ -2131,7 +2900,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // 0 is included in the numeric interval as no actual constructor was ever
   // called
@@ -2204,7 +2973,7 @@ TEST_F(InterproceduralConstantPropagationTest,
 
   auto fp_iter = InterproceduralConstantPropagationPass(config).analyze(
       scope, &m_immut_analyzer_state, &m_api_level_analyzer_state,
-      &m_string_analyzer_state, &m_package_name_state, m_cp_state);
+      &m_string_analyzer_state, &m_package_name_state, m_null_check_methods);
   const auto& wps = fp_iter->get_whole_program_state();
   // 0 is included in the numeric interval as the field was read before written
   EXPECT_EQ(wps.get_field_value(field_f),

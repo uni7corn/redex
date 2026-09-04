@@ -26,7 +26,6 @@ using Scope = std::vector<DexClass*>;
 
 constexpr const char* CLASS_SPLITTING_RELOCATED_SUFFIX = "$relocated";
 constexpr const size_t CLASS_SPLITTING_RELOCATED_SUFFIX_LEN = 10;
-constexpr const char* CLASS_SPLITTING_RELOCATED_SUFFIX_SEMI = "$relocated;";
 
 namespace Json {
 class Value;
@@ -136,12 +135,10 @@ struct ConfigFiles {
 
   const UnorderedMap<std::string, DeadClassLoadCounts>& get_dead_class_list();
   const std::vector<std::string>& get_halfnosis_block_list();
-  const UnorderedSet<std::string>& get_live_class_split_list();
 
-  void clear_dead_class_and_live_relocated_sets() {
+  void clear_dead_class_list() {
     m_dead_class_list_attempted = false;
     m_dead_classes.clear();
-    m_live_relocated_classes.clear();
   }
 
   method_profiles::MethodProfiles& get_method_profiles() {
@@ -253,6 +250,7 @@ struct ConfigFiles {
   bool enforce_class_order() const;
 
   bool disable_violation_fixes() const;
+  bool preserve_count_integrity() const;
 
   // If true, classes.dex is treated like any other dex file in the root of
   // the input program. This is derived from InterDexPass configuration, which
@@ -270,7 +268,7 @@ struct ConfigFiles {
   UnorderedMap<std::string, std::vector<std::string>> load_class_lists();
   void ensure_agg_method_stats_loaded();
   void ensure_secondary_method_stats_loaded() const;
-  void build_dead_class_and_live_class_split_lists();
+  void build_dead_class_list();
   void build_halfnosis_block_list();
   bool is_relocated_class(std::string_view name) const;
   void remove_relocated_part(std::string_view* name);
@@ -300,7 +298,6 @@ struct ConfigFiles {
   std::string m_printseeds; // Filename to dump computed seeds.
   mutable std::unique_ptr<method_profiles::MethodProfiles> m_method_profiles;
   UnorderedMap<std::string, DeadClassLoadCounts> m_dead_classes;
-  UnorderedSet<std::string> m_live_relocated_classes;
 
   // limits the output instruction size of any DexMethod to 2^n
   // 0 when limit is not present

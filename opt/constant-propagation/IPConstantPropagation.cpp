@@ -9,11 +9,13 @@
 
 #include <future>
 
+#include "AtomicStatCounter.h"
 #include "ConfigFiles.h"
 #include "ConstantEnvironment.h"
 #include "ConstantPropagationAnalysis.h"
 #include "ConstantPropagationState.h"
 #include "ConstructorParams.h"
+#include "Debug.h"
 #include "DefinitelyAssignedIFields.h"
 #include "DexUtil.h"
 #include "IPConstantPropagationAnalysis.h"
@@ -22,6 +24,7 @@
 #include "Purity.h"
 #include "ScopedMetrics.h"
 #include "Show.h"
+#include "StringBuilderAppendChain.h"
 #include "Trace.h"
 #include "Walkers.h"
 #include "WrappedPrimitives.h"
@@ -71,7 +74,7 @@ class AnalyzerGenerator {
   EnumFieldAnalyzerState m_enum_field_analyzer_state;
   StringAnalyzerState* m_string_analyzer_state;
   PackageNameState* m_package_name_state;
-  const State& m_cp_state;
+  const NullCheckMethods& m_null_check_methods;
 
  public:
   explicit AnalyzerGenerator(
@@ -79,12 +82,12 @@ class AnalyzerGenerator {
       ApiLevelAnalyzerState* api_level_analyzer_state,
       StringAnalyzerState* string_analyzer_state,
       PackageNameState* package_name_state,
-      const State& cp_state)
+      const NullCheckMethods& null_check_methods)
       : m_immut_analyzer_state(immut_analyzer_state),
         m_api_level_analyzer_state(api_level_analyzer_state),
         m_string_analyzer_state(string_analyzer_state),
         m_package_name_state(package_name_state),
-        m_cp_state(cp_state) {}
+        m_null_check_methods(null_check_methods) {}
 
   std::unique_ptr<IntraproceduralAnalysis> operator()(
       const DexMethod* method,
@@ -112,7 +115,7 @@ class AnalyzerGenerator {
     auto wps_accessor = std::make_unique<WholeProgramStateAccessor>(wps);
     auto* wps_accessor_ptr = wps_accessor.get();
     return std::make_unique<IntraproceduralAnalysis>(
-        &m_cp_state, std::move(wps_accessor), code.cfg(),
+        &m_null_check_methods, std::move(wps_accessor), code.cfg(),
         CombinedAnalyzer(
             class_under_init, m_immut_analyzer_state, wps_accessor_ptr,
             m_enum_field_analyzer_state, m_boxed_boolean_analyzer_state,
@@ -143,7 +146,7 @@ std::unique_ptr<FixpointIterator> PassImpl::analyze(
     ApiLevelAnalyzerState* api_level_analyzer_state,
     StringAnalyzerState* string_analyzer_state,
     PackageNameState* package_name_state,
-    const State& cp_state) {
+    const NullCheckMethods& null_check_methods) {
   auto method_override_graph = mog::build_graph(scope);
   std::shared_ptr<call_graph::Graph> cg;
   {
@@ -164,7 +167,8 @@ std::unique_ptr<FixpointIterator> PassImpl::analyze(
   auto fp_iter = std::make_unique<FixpointIterator>(
       cg,
       AnalyzerGenerator(immut_analyzer_state, api_level_analyzer_state,
-                        string_analyzer_state, package_name_state, cp_state),
+                        string_analyzer_state, package_name_state,
+                        null_check_methods),
       cg_for_wps);
   // Run the bootstrap. All field value and method return values are
   // represented by Top.
@@ -243,8 +247,15 @@ void PassImpl::optimize(
     const XStoreRefs& xstores,
     const FixpointIterator& fp_iter,
     const ImmutableAttributeAnalyzerState* immut_analyzer_state,
-    const State& cp_state) {
+    const NullCheckMethods& null_check_methods) {
   const auto& pure_methods = ::get_pure_methods();
+  // `String.concat` is a method ref, which InterDex budgets per dex, so one it
+  // has already packed may have no room for it.
+  const bool reduce_concat =
+      m_config.reduce_stringbuilder_concat && !m_interdex_has_run;
+  AtomicStatCounter<size_t> appends_merged{0};
+  AtomicStatCounter<size_t> stringbuilder_constant_tostrings_replaced{0};
+  AtomicStatCounter<size_t> concat_reduced{0};
   m_transform_stats =
       walk::parallel::methods<Transform::Stats>(scope, [&](DexMethod* method) {
         if (method->get_code() == nullptr ||
@@ -265,7 +276,7 @@ void PassImpl::optimize(
           config.getter_methods_for_immutable_fields =
               &immut_analyzer_state->attribute_methods;
           config.pure_methods = &pure_methods;
-          Transform tf(config, cp_state);
+          Transform tf(config, null_check_methods);
           tf.legacy_apply_constants_and_prune_unreachable(
               ipa->fp_iter,
               fp_iter.get_whole_program_state(),
@@ -278,9 +289,38 @@ void PassImpl::optimize(
           wrapped_primitives::optimize_method(type_system, ipa->fp_iter,
                                               fp_iter.get_whole_program_state(),
                                               method, code.cfg());
+          // The merge goes first: shortening a chain to two appends brings it
+          // within the concat reduction's reach, and the concatenation it
+          // materializes is a const-string, which that reduction requires to be
+          // provably non-null.
+          if (m_config.merge_adjacent_constant_appends) {
+            appends_merged +=
+                stringbuilder_append_chain::merge_adjacent_constant_appends(
+                    ipa->fp_iter, code.cfg());
+          }
+          // This must come after merge_adjacent_constant_appends because it can
+          // take advantage of the result of merge_adjacent_constant_appends,
+          // which increases the number of of StringBuilder-append-toString
+          // chains that contain only one append on constant.
+          if (m_config
+                  .replace_constant_stringbuilder_tostring_with_const_string) {
+            stringbuilder_constant_tostrings_replaced +=
+                stringbuilder_append_chain::
+                    replace_constant_tostring_with_const_string(ipa->fp_iter,
+                                                                code.cfg());
+          }
+          if (reduce_concat) {
+            concat_reduced +=
+                stringbuilder_append_chain::reduce_two_append_concats(
+                    ipa->fp_iter, code.cfg());
+          }
           return tf.get_stats();
         }
       });
+  m_appends_merged = appends_merged.load();
+  m_stringbuilder_constant_tostrings_replaced =
+      stringbuilder_constant_tostrings_replaced.load();
+  m_concat_reduced = concat_reduced.load();
 }
 
 void PassImpl::run(const DexStoresVector& stores,
@@ -305,7 +345,7 @@ void PassImpl::run(const DexStoresVector& stores,
   ApiLevelAnalyzerState api_level_analyzer_state{min_sdk};
   auto string_analyzer_state = StringAnalyzerState::make_default();
   auto package_name_state = PackageNameState::make(package_name);
-  State cp_state;
+  NullCheckMethods null_check_methods;
   // Ensure java.lang.Object's DexClass and methods exist before launching the
   // async TypeSystem construction. TypeSystem → ClassScopes →
   // build_signature_map → get_vmethods may lazily call create_object_class(),
@@ -319,11 +359,11 @@ void PassImpl::run(const DexStoresVector& stores,
       std::async(std::launch::async, [&scope]() { return TypeSystem(scope); });
   auto fp_iter =
       analyze(scope, &immut_analyzer_state, &api_level_analyzer_state,
-              &string_analyzer_state, &package_name_state, cp_state);
+              &string_analyzer_state, &package_name_state, null_check_methods);
   m_stats.fp_iter = fp_iter->get_stats();
   auto type_system = type_system_future.get();
   optimize(scope, type_system, xstores, *fp_iter, &immut_analyzer_state,
-           cp_state);
+           null_check_methods);
 }
 
 void PassImpl::eval_pass(DexStoresVector& /*stores*/,
@@ -339,6 +379,8 @@ void PassImpl::run_pass(DexStoresVector& stores,
     m_config.runtime_assert =
         RuntimeAssertTransform::Config(config.get_proguard_map());
   }
+
+  m_interdex_has_run = mgr.interdex_has_run();
 
   const auto& options = mgr.get_redex_options();
   run(stores, config, options.min_sdk, options.package_name);
@@ -363,6 +405,10 @@ void PassImpl::run_pass(DexStoresVector& stores,
 
   mgr.set_metric("config.max_heap_analysis_iterations",
                  m_config.max_heap_analysis_iterations);
+  mgr.incr_metric("stringbuilder_appends_merged", m_appends_merged);
+  mgr.incr_metric("stringbuilder_constant_tostrings_replaced",
+                  m_stringbuilder_constant_tostrings_replaced);
+  mgr.incr_metric("stringbuilder_concat_reduced", m_concat_reduced);
 }
 
 static PassImpl s_pass;

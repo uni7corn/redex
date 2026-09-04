@@ -22,6 +22,7 @@
 #include "ControlFlow.h"
 #include "CppUtil.h"
 #include "Creators.h"
+#include "Debug.h"
 #include "DexAnnotation.h"
 #include "DexCallSite.h"
 #include "DexClass.h"
@@ -1502,8 +1503,8 @@ std::string show(const SwitchIndices& si) {
   return ss.str();
 }
 
-std::ostream& operator<<(std::ostream& o, const MethodItemEntry& mie) {
-  o << "[" << &mie << "] ";
+std::string show_mie_plain(const MethodItemEntry& mie) {
+  std::ostringstream o;
   switch (mie.type) {
   case MFLOW_OPCODE:
     o << "OPCODE: " << show(mie.insn);
@@ -1537,10 +1538,19 @@ std::ostream& operator<<(std::ostream& o, const MethodItemEntry& mie) {
   case MFLOW_SOURCE_BLOCK:
     o << "SOURCE-BLOCKS: " << mie.src_block->show();
     break;
+  case MFLOW_REMARK:
+    o << "REMARK: " << show(mie.remark->producer) << " "
+      << show(mie.remark->val_str) << " " << mie.remark->val_int;
+    break;
   case MFLOW_FALLTHROUGH:
     o << "FALLTHROUGH";
     break;
   }
+  return o.str();
+}
+
+std::ostream& operator<<(std::ostream& o, const MethodItemEntry& mie) {
+  o << "[" << &mie << "] " << show_mie_plain(mie);
   return o;
 }
 
@@ -1567,8 +1577,7 @@ std::ostream& operator<<(std::ostream& o, const DexCallSite& cs) {
 std::string show(const IRList* ir, bool code_only) {
   std::string ret;
   for (auto const& mie : *ir) {
-    if (!code_only || (code_only && mie.type != MFLOW_POSITION &&
-                       mie.type != MFLOW_SOURCE_BLOCK)) {
+    if (!code_only || shown_in_code_only(mie.type)) {
       ret += show(mie);
       ret += "\n";
     }
@@ -1579,6 +1588,8 @@ std::string show(const IRList* ir, bool code_only) {
 namespace {
 
 struct NoneSpecial {
+  std::string show_mie(const MethodItemEntry& mie) const { return show(mie); }
+
   void mie_before(std::ostream&, const MethodItemEntry&) {}
   void mie_after(std::ostream&, const MethodItemEntry&) {}
   void start_block(std::ostream&, const cfg::Block*) {}
@@ -1627,6 +1638,7 @@ std::string show(DexIdx* p) {
      << "----------------------------------------\n";
   for (uint32_t i = 0; i < p->m_string_ids_size; i++) {
     always_assert(i < p->m_string_cache.size());
+    // NOLINTNEXTLINE(facebook-hte-ParameterUncheckedArrayBounds)
     ss << show(p->m_string_cache[i]) << "\n";
   }
   ss << "----------------------------------------\n"
@@ -1634,6 +1646,7 @@ std::string show(DexIdx* p) {
      << "----------------------------------------\n";
   for (uint32_t i = 0; i < p->m_type_ids_size; i++) {
     always_assert(i < p->m_type_cache.size());
+    // NOLINTNEXTLINE(facebook-hte-ParameterUncheckedArrayBounds)
     ss << show(p->m_type_cache[i]) << "\n";
   }
   ss << "----------------------------------------\n"
@@ -1641,6 +1654,7 @@ std::string show(DexIdx* p) {
      << "----------------------------------------\n";
   for (uint32_t i = 0; i < p->m_field_ids_size; i++) {
     always_assert(i < p->m_field_cache.size());
+    // NOLINTNEXTLINE(facebook-hte-ParameterUncheckedArrayBounds)
     ss << show(p->m_field_cache[i]) << "\n";
   }
   ss << "----------------------------------------\n"
@@ -1648,6 +1662,7 @@ std::string show(DexIdx* p) {
      << "----------------------------------------\n";
   for (uint32_t i = 0; i < p->m_method_ids_size; i++) {
     always_assert(i < p->m_method_cache.size());
+    // NOLINTNEXTLINE(facebook-hte-ParameterUncheckedArrayBounds)
     ss << show(p->m_method_cache[i]) << "\n";
   }
   return ss.str();

@@ -9,6 +9,7 @@
 
 #include "ControlFlow.h"
 #include "DexClass.h"
+#include "IROpcode.h"
 
 struct PartialCode;
 
@@ -20,7 +21,15 @@ bool maybe_hot(cfg::Block* b);
 
 bool is_hot(cfg::Block* b);
 
+/**
+ * The opcode with which the partially inlined code invokes the method in its
+ * fallback invocation. Whether that reproduces the invocation being replaced
+ * is what `MultiMethodInliner::can_invoke_callee_directly` decides.
+ */
+IROpcode get_fallback_invoke_opcode(const DexMethod* method);
+
 PartialCode get_partially_inlined_code(const DexMethod* method,
-                                       const cfg::ControlFlowGraph& cfg);
+                                       const cfg::ControlFlowGraph& cfg,
+                                       uint32_t max_code_units);
 
 } // namespace inliner

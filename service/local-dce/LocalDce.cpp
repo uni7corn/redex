@@ -7,11 +7,11 @@
 
 #include "LocalDce.h"
 
-#include <array>
 #include <vector>
 
 #include "CFGMutation.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "GraphUtil.h"
 #include "IRCode.h"

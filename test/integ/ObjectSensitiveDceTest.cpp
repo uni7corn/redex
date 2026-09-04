@@ -7,7 +7,6 @@
 
 #include <gtest/gtest.h>
 #include <json/json.h>
-#include <unordered_set>
 
 #include "IRCode.h"
 #include "MethodUtil.h"

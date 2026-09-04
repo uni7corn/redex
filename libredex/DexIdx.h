@@ -121,6 +121,8 @@ class DexIdx {
     return m_field_cache[fidx];
   }
 
+  uint32_t get_field_ids_size() { return m_field_ids_size; }
+
   uint32_t get_method_ids_size() { return m_method_ids_size; }
 
   DexMethodRef* get_methodidx(uint32_t midx) {
@@ -205,6 +207,19 @@ class DexIdx {
     always_assert_type_log(offset < get_file_size(), INVALID_DEX,
                            "Dex overflow");
     return m_dexbase + offset;
+  }
+
+  // Bounds-checked ULEB128 reader. Returns the decoded value and advances
+  // *ptr past the consumed bytes. Throws RedexError::INVALID_DEX if *ptr
+  // is past end() or if the encoded value would read past end().
+  uint32_t read_uleb128_checked(const uint8_t** ptr) {
+    always_assert_type_log(*ptr <= end(), INVALID_DEX,
+                           "ULEB128 ptr past end of dex");
+    std::string_view view{reinterpret_cast<const char*>(*ptr),
+                          static_cast<size_t>(end() - *ptr)};
+    uint32_t result = ::read_uleb128_checked<redex::DexAssert>(view);
+    *ptr = reinterpret_cast<const uint8_t*>(view.data());
+    return result;
   }
 
   uint32_t get_checksum() const {

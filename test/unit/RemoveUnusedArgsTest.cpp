@@ -7,7 +7,6 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include <iterator>
 
 #include "ControlFlow.h"
 #include "IRAssembler.h"

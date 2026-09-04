@@ -14,7 +14,6 @@
 #include "ConfigFiles.h"
 #include "Debug.h"
 #include "DeterministicContainers.h"
-#include "DexOutput.h"
 #include "DexStore.h"
 #include "DexUtil.h"
 #include "ProguardMap.h"

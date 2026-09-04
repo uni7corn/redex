@@ -10,6 +10,7 @@
 #include <iostream>
 
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "ModelMerger.h"
 #include "NormalizeConstructor.h"
 #include "PassManager.h"
@@ -113,10 +114,13 @@ ModelStats merge_model(Scope& scope,
   if (spec.merging_targets.empty()) {
     return ModelStats();
   }
-  return merge_model(type_system, scope, conf, mgr, stores, spec, is_intra_dex);
+  virtual_scope::VirtualScopes vscopes(scope);
+  return merge_model(type_system, vscopes, scope, conf, mgr, stores, spec,
+                     is_intra_dex);
 }
 
 ModelStats merge_model(const TypeSystem& type_system,
+                       const virtual_scope::VirtualScopes& vscopes,
                        Scope& scope,
                        ConfigFiles& conf,
                        PassManager& mgr,
@@ -133,8 +137,8 @@ ModelStats merge_model(const TypeSystem& type_system,
   XStoreRefs xstores(stores, conf.normal_primary_dex());
   auto refchecker =
       create_ref_checker(spec.per_dex_grouping, &xstores, conf, min_sdk);
-  auto model =
-      Model::build_model(scope, stores, conf, spec, type_system, *refchecker);
+  auto model = Model::build_model(scope, stores, conf, spec, type_system,
+                                  vscopes, *refchecker);
   ModelStats stats = model.get_model_stats();
   bool update_method_profiles_stats;
   conf.get_json_config().get("update_method_profiles_stats", false,
@@ -153,6 +157,7 @@ ModelStats merge_model(const TypeSystem& type_system,
 }
 
 Model construct_model(const TypeSystem& type_system,
+                      const virtual_scope::VirtualScopes& vscopes,
                       Scope& scope,
                       ConfigFiles& conf,
                       PassManager& mgr,
@@ -169,8 +174,8 @@ Model construct_model(const TypeSystem& type_system,
   XStoreRefs xstores(stores, conf.normal_primary_dex());
   auto refchecker =
       create_ref_checker(spec.per_dex_grouping, &xstores, conf, min_sdk);
-  auto model =
-      Model::build_model(scope, stores, conf, spec, type_system, *refchecker);
+  auto model = Model::build_model(scope, stores, conf, spec, type_system,
+                                  vscopes, *refchecker);
   return model;
 }
 

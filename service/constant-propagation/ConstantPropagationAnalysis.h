@@ -26,21 +26,43 @@ class DexMethodRef;
 
 namespace constant_propagation {
 
-std::optional<size_t> get_null_check_object_index(const IRInstruction* insn,
-                                                  const State& state);
+std::optional<size_t> get_null_check_object_index(
+    const IRInstruction* insn, const NullCheckMethods& null_check_methods);
+
+// The exact runtime type of an object constant -- String for a const-string,
+// Class for a const-class -- or nullptr when the value is not such a constant.
+const DexType* get_object_constant_type(const ConstantValue& value);
 
 namespace intraprocedural {
+
+// The default no-throw analyzer's logic, as a composable analyzer class:
+// along an instruction's no-throw successor edge, refine a dereferenced or
+// null-checked source register to non-null.
+class DefaultNoThrowAnalyzer final
+    : public InstructionAnalyzerBase<DefaultNoThrowAnalyzer,
+                                     ConstantEnvironment,
+                                     const NullCheckMethods*> {
+ public:
+  static bool analyze_default(const NullCheckMethods* null_check_methods,
+                              const IRInstruction* insn,
+                              ConstantEnvironment* env);
+};
+
+/*
+ * Returns the default no-throw analyzer, which refines source-register values
+ * along an instruction's no-throw successor edge. The optional `state` is
+ * forwarded to the returned analyzer.
+ */
+InstructionAnalyzer<ConstantEnvironment> make_default_no_throw_analyzer(
+    const NullCheckMethods* null_check_methods = nullptr);
 
 class FixpointIterator final
     : public ir_analyzer::BaseEdgeAwareIRAnalyzer<ConstantEnvironment> {
  public:
-  /*
-   * The fixpoint iterator takes an optional WholeProgramState argument that
-   * it will use to determine the static field values and method return values.
-   */
-  FixpointIterator(const State* state,
-                   const cfg::ControlFlowGraph& cfg,
+  FixpointIterator(const cfg::ControlFlowGraph& cfg,
                    InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
+                   InstructionAnalyzer<ConstantEnvironment> no_throw_analyzer =
+                       make_default_no_throw_analyzer(),
                    bool imprecise_switches = false);
 
   void clear_switch_succ_cache() const { m_switch_succs.clear(); }
@@ -64,7 +86,7 @@ class FixpointIterator final
   using SwitchSuccs = UnorderedMap<int32_t, uint32_t>;
   mutable UnorderedMap<cfg::Block*, SwitchSuccs> m_switch_succs;
   InstructionAnalyzer<ConstantEnvironment> m_insn_analyzer;
-  const State* m_state;
+  InstructionAnalyzer<ConstantEnvironment> m_no_throw_analyzer;
   const bool m_imprecise_switches;
 
   const SwitchSuccs& find_switch_succs(cfg::Block* block) const {
@@ -472,6 +494,13 @@ class ConstantClassObjectAnalyzer
  */
 // TODO(T257927964): Remove this.
 extern bool known_non_null_returns_enable;
+
+// TODO(T275196808): Remove this once the per-parameter exit-value summary is
+// fully rolled out.
+extern bool enable_param_exit_value_summary;
+
+// TODO(T279417132): Remove this once the behavior is fully rolled out.
+extern bool enable_check_cast_value_preservation;
 
 class KnownNonNullReturnsAnalyzer
     : public InstructionAnalyzerBase<KnownNonNullReturnsAnalyzer,

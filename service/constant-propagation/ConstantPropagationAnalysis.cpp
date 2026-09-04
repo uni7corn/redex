@@ -11,10 +11,13 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
-#include <mutex>
-#include <set>
 #include <type_traits>
 
+#include "ControlFlow.h"
+#include "Debug.h"
+#include "DeterministicContainers.h"
+#include "IRCode.h"
+#include "IRInstruction.h"
 #include "RedexContext.h"
 
 #include <bit>
@@ -34,7 +37,6 @@ std::enable_if_t<std::is_integral<T>::value, int> fpclassify(T x) {
 #include "DexInstruction.h"
 #include "Resolver.h"
 #include "Trace.h"
-#include "Transform.h"
 
 // Signed integer overflow is undefined behavior in C++20, but the two's
 // complement wrapping matches the required Java semantics. So silence ubsan.
@@ -162,12 +164,12 @@ inline INT_TYPE art_float_to_integral(FLOAT_TYPE f) {
 
 namespace constant_propagation {
 
-std::optional<size_t> get_null_check_object_index(const IRInstruction* insn,
-                                                  const State& state) {
+std::optional<size_t> get_null_check_object_index(
+    const IRInstruction* insn, const NullCheckMethods& null_check_methods) {
   switch (insn->opcode()) {
   case OPCODE_INVOKE_STATIC: {
     auto* method = insn->get_method();
-    if (state.kotlin_null_check_assertions().count(method) != 0u) {
+    if (null_check_methods.kotlin_null_check_assertions().count(method) != 0u) {
       // Note: We are not assuming here that the first argument is the checked
       // argument of type object, as it might not be. For example,
       // RemoveUnusedArgs may have removed or otherwise reordered the arguments.
@@ -402,6 +404,34 @@ bool LocalArrayAnalyzer::analyze_fill_array_data(const IRInstruction* insn,
   return false;
 }
 
+namespace {
+
+template <typename T>
+bool try_constant_type(ConstantEnvironment* env,
+                       const ConstantValue& val,
+                       size_t idx) {
+  auto t_val = val.maybe_get<T>();
+  if (!t_val) {
+    return false;
+  }
+  if (t_val->is_top() || t_val->is_bottom()) {
+    env->set_array_binding(RESULT_REGISTER, idx, SignedConstantDomain());
+    return true;
+  }
+
+  env->set_array_binding(RESULT_REGISTER, idx, val);
+  return true;
+}
+
+template <typename... T>
+bool try_constant_types(ConstantEnvironment* env,
+                        const ConstantValue& val,
+                        size_t idx) {
+  return (try_constant_type<T>(env, val, idx) || ...);
+}
+
+} // namespace
+
 bool LocalArrayAnalyzer::analyze_filled_new_array(const IRInstruction* insn,
                                                   ConstantEnvironment* env) {
   auto array_size = insn->srcs_size();
@@ -411,11 +441,9 @@ bool LocalArrayAnalyzer::analyze_filled_new_array(const IRInstruction* insn,
     env->new_heap_value(RESULT_REGISTER, insn,
                         ConstantValueArrayDomain(array_size));
     for (src_index_t i = 0; i < array_size; i++) {
-      auto value = env->get(insn->src(i)).maybe_get<SignedConstantDomain>();
-      if (value && !value->is_top() && !value->is_bottom()) {
-        env->set_array_binding(RESULT_REGISTER, i,
-                               SignedConstantDomain(*value->get_constant()));
-      } else {
+      if (!try_constant_types<SignedConstantDomain, ConstantInjectionIdDomain,
+                              ConstantResourceIdDomain>(
+              env, env->get(insn->src(i)), i)) {
         env->set_array_binding(RESULT_REGISTER, i, SignedConstantDomain());
       }
     }
@@ -526,14 +554,24 @@ bool PrimitiveAnalyzer::analyze_const(const IRInstruction* insn,
   return true;
 }
 
+// TODO(T279417132): Remove this once the behavior is fully rolled out.
+bool enable_check_cast_value_preservation = false;
+
 bool PrimitiveAnalyzer::analyze_check_cast(const IRInstruction* insn,
                                            ConstantEnvironment* env) {
   auto src = env->get(insn->src(0));
-  if (src.is_zero()) {
-    env->set(RESULT_REGISTER, SignedConstantDomain(0));
-    return true;
+  if (!enable_check_cast_value_preservation) {
+    // Carry a null operand through as null; leave everything else unknown.
+    if (src.is_zero()) {
+      env->set(RESULT_REGISTER, SignedConstantDomain(0));
+      return true;
+    }
+    return analyze_default(insn, env);
   }
-  return analyze_default(insn, env);
+  // A successful check-cast returns its operand unchanged, so the result holds
+  // the operand's value.
+  env->set(RESULT_REGISTER, src);
+  return true;
 }
 
 bool PrimitiveAnalyzer::analyze_instance_of(const IRInstruction* insn,
@@ -542,6 +580,12 @@ bool PrimitiveAnalyzer::analyze_instance_of(const IRInstruction* insn,
   if (src.is_zero()) {
     env->set(RESULT_REGISTER, SignedConstantDomain(0));
     return true;
+  }
+  if (const DexType* src_type = get_object_constant_type(src)) {
+    if (auto res = type::evaluate_type_check(src_type, insn->get_type())) {
+      env->set(RESULT_REGISTER, SignedConstantDomain(*res));
+      return true;
+    }
   }
   return analyze_default(insn, env);
 }
@@ -1744,8 +1788,8 @@ void semantically_inline_method(
       [env](ConstantHeap* heap) { *heap = env->get_heap(); });
 
   // Analyze the callee.
-  auto fp_iter = std::make_unique<intraprocedural::FixpointIterator>(
-      /* cp_state */ nullptr, cfg, analyzer);
+  auto fp_iter =
+      std::make_unique<intraprocedural::FixpointIterator>(cfg, analyzer);
   fp_iter->run(call_entry_env);
 
   // Update the caller's environment with the callee's return states.
@@ -1860,16 +1904,27 @@ bool PackageNameAnalyzer::analyze_invoke(const PackageNameState* state,
   return false;
 }
 
+const DexType* get_object_constant_type(const ConstantValue& value) {
+  if (auto s = value.maybe_get<StringDomain>(); s && s->get_constant()) {
+    return type::java_lang_String();
+  }
+  if (auto c = value.maybe_get<ConstantClassObjectDomain>();
+      c && c->get_constant()) {
+    return type::java_lang_Class();
+  }
+  return nullptr;
+}
+
 namespace intraprocedural {
 
 FixpointIterator::FixpointIterator(
-    const State* state,
     const cfg::ControlFlowGraph& cfg,
     InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
+    InstructionAnalyzer<ConstantEnvironment> no_throw_analyzer,
     bool imprecise_switches)
     : BaseEdgeAwareIRAnalyzer(cfg),
       m_insn_analyzer(std::move(insn_analyzer)),
-      m_state(state),
+      m_no_throw_analyzer(std::move(no_throw_analyzer)),
       m_imprecise_switches(imprecise_switches) {}
 
 void FixpointIterator::analyze_instruction_normal(
@@ -1877,32 +1932,66 @@ void FixpointIterator::analyze_instruction_normal(
   m_insn_analyzer(insn, env);
 }
 
-void FixpointIterator::analyze_no_throw(const IRInstruction* insn,
-                                        ConstantEnvironment* env) const {
+bool DefaultNoThrowAnalyzer::analyze_default(
+    const NullCheckMethods* null_check_methods,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  // This case is an unconditional throw, so the no-throw successor is dead.
+  // Pruning it stops the constant from reaching a downstream pass that would
+  // materialize it into a target-typed slot it cannot hold -- ill-typed code.
+  // External targets are skipped: their class hierarchy may be incomplete to
+  // decide castability.
+  if (enable_check_cast_value_preservation &&
+      insn->opcode() == OPCODE_CHECK_CAST) {
+    const DexType* const_type =
+        get_object_constant_type(env->get(insn->src(0)));
+    if (const_type != nullptr) {
+      auto* target_cls = type_class(insn->get_type());
+      if (target_cls != nullptr && !target_cls->is_external() &&
+          !type::check_cast(const_type, insn->get_type())) {
+        env->set_to_bottom();
+      }
+    }
+    return false;
+  }
   auto src_index = get_dereferenced_object_src_index(insn);
-  if (!src_index && (m_state != nullptr)) {
-    src_index = get_null_check_object_index(insn, *m_state);
+  if (!src_index && null_check_methods != nullptr) {
+    src_index = get_null_check_object_index(insn, *null_check_methods);
   }
   if (!src_index) {
-    // Check if it is redex null check.
-    if ((m_state == nullptr) || insn->opcode() != OPCODE_INVOKE_STATIC ||
-        insn->get_method() != m_state->redex_null_check_assertion()) {
-      return;
+    if (null_check_methods == nullptr ||
+        insn->opcode() != OPCODE_INVOKE_STATIC ||
+        insn->get_method() !=
+            null_check_methods->redex_null_check_assertion()) {
+      return false;
     }
     src_index = 0;
   }
-
   if (insn->has_dest()) {
     auto dest = insn->dest();
     if ((dest == *src_index) ||
         (insn->dest_is_wide() && dest + 1 == *src_index)) {
-      return;
+      return false;
     }
   }
   auto src = insn->src(*src_index);
   auto value = env->get(src);
   value.meet_with(SignedConstantDomain(sign_domain::Interval::NEZ));
   env->set(src, value);
+  return false;
+}
+
+InstructionAnalyzer<ConstantEnvironment> make_default_no_throw_analyzer(
+    const NullCheckMethods* null_check_methods) {
+  return InstructionAnalyzerCombiner<DefaultNoThrowAnalyzer>(
+      null_check_methods);
+}
+
+void FixpointIterator::analyze_no_throw(const IRInstruction* insn,
+                                        ConstantEnvironment* env) const {
+  if (m_no_throw_analyzer) {
+    m_no_throw_analyzer(insn, env);
+  }
 }
 
 /*

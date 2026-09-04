@@ -12,6 +12,7 @@
 #include <sparta/WeakTopologicalOrdering.h>
 
 #include "CppUtil.h"
+#include "Debug.h"
 #include "SourceBlocks.h"
 
 namespace method_splitting_impl {
@@ -48,19 +49,23 @@ std::string_view describe(std::optional<HotSplitKind> kind) {
   }
 }
 
-std::vector<const cfg::Edge*> ReducedBlock::expand_preds(
+// The bag type is the point: no consumer of these edges depends on their order
+// -- one takes an order-independent min, the other folds them into flags and a
+// set -- and a `std::vector` here would only invite someone to assume the hash
+// order it happens to arrive in is meaningful.
+UnorderedBag<const cfg::Edge*> ReducedBlock::expand_preds(
     cfg::Block* src) const {
-  std::vector<const cfg::Edge*> res;
+  UnorderedBag<const cfg::Edge*> res;
   for (const auto* reduced_edge : UnorderedIterable(preds)) {
     if (src == nullptr) {
-      insert_unordered_iterable(res, res.end(), reduced_edge->edges);
+      insert_unordered_iterable(res, reduced_edge->edges);
       continue;
     }
-    for (const auto* e : UnorderedIterable(reduced_edge->edges)) {
+    unordered_for_each(reduced_edge->edges, [src, &res](const cfg::Edge* e) {
       if (e->src() == src) {
-        res.push_back(e);
+        res.insert(e);
       }
-    }
+    });
   }
   return res;
 }
@@ -104,19 +109,17 @@ ReducedControlFlowGraph::ReducedControlFlowGraph(cfg::ControlFlowGraph& cfg)
     auto& blocks = reduced_block->blocks;
     for (const auto* b : UnorderedIterable(blocks)) {
       for (auto* e : b->succs()) {
-        if ((e->target() != nullptr) && (blocks.count(e->target()) == 0u)) {
-          always_assert(m_blocks.count(e->target()));
+        if ((e->target() != nullptr) && !blocks.contains(e->target())) {
           auto* reduced_edge =
-              get_edge(reduced_block.get(), m_blocks.at(e->target()));
+              get_edge(reduced_block.get(), get_reduced_block(e->target()));
           reduced_block->succs.insert(reduced_edge);
           reduced_edge->edges.insert(e);
         }
       }
       for (auto* e : b->preds()) {
-        if ((e->src() != nullptr) && (blocks.count(e->src()) == 0u)) {
-          always_assert(m_blocks.count(e->src()));
+        if ((e->src() != nullptr) && !blocks.contains(e->src())) {
           auto* reduced_edge =
-              get_edge(m_blocks.at(e->src()), reduced_block.get());
+              get_edge(get_reduced_block(e->src()), reduced_block.get());
           reduced_block->preds.insert(reduced_edge);
           reduced_edge->edges.insert(e);
         }
@@ -141,8 +144,7 @@ std::vector<const ReducedBlock*> ReducedControlFlowGraph::blocks() const {
 }
 
 const ReducedBlock* ReducedControlFlowGraph::entry_block() const {
-  always_assert(m_blocks.count(m_cfg.entry_block()));
-  return m_blocks.at(m_cfg.entry_block());
+  return get_reduced_block(m_cfg.entry_block());
 }
 
 UnorderedSet<const ReducedBlock*> ReducedControlFlowGraph::reachable(
@@ -167,7 +169,14 @@ UnorderedSet<const ReducedBlock*> ReducedControlFlowGraph::reachable(
 
 ReducedBlock* ReducedControlFlowGraph::get_reduced_block(
     const cfg::Block* block) const {
-  return m_blocks.at(block);
+  // Checked before the lookup, because the not-found message below reports
+  // `block->id()`: a null block is absent from the map too, so without this it
+  // would fail by dereferencing null while building its own diagnostic.
+  always_assert_log(block != nullptr, "no block given");
+  auto it = m_blocks.find(block);
+  always_assert_log(it != m_blocks.end(),
+                    "block B%zu is not in the reduced CFG", block->id());
+  return it->second;
 }
 
 } // namespace method_splitting_impl

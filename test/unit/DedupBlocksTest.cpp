@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <array>
 #include <gtest/gtest.h>
-#include <iterator>
 #include <utility>
 
 #include "Creators.h"
@@ -16,6 +16,7 @@
 #include "IRCode.h"
 #include "IROpcode.h"
 #include "RedexTest.h"
+#include "Show.h"
 #include "SourceBlocks.h"
 #include "Walkers.h"
 
@@ -1647,6 +1648,150 @@ TEST_F(DedupBlocksTest, dont_dedup_indirect_fill_in_stack_trace) {
   EXPECT_CODE_EQ(expected_code.get(), code);
 }
 
+// Don't dedup blocks calling kotlin.jvm.internal.Intrinsics throw* helpers.
+// These static helpers throw an exception inside their body; their call-site
+// PC is what symbolicates in the resulting stack trace, so collapsing two
+// callers into a single shared call site mis-attributes runtime exceptions
+// (e.g. a lateinit-access UninitializedPropertyAccessException) to whichever
+// caller happened to emit its position MIE just before the dedupped block.
+TEST_F(DedupBlocksTest, dont_dedup_kotlin_intrinsics_throw_helper) {
+  auto input_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (const-string "fieldA")
+      (move-result-pseudo-object v0)
+      (invoke-static (v0) "Lkotlin/jvm/internal/Intrinsics;.throwUninitializedPropertyAccessException:(Ljava/lang/String;)V")
+      (return-void)
+
+      (:lbl)
+      (const-string "fieldB")
+      (move-result-pseudo-object v0)
+      (invoke-static (v0) "Lkotlin/jvm/internal/Intrinsics;.throwUninitializedPropertyAccessException:(Ljava/lang/String;)V")
+      (return-void)
+    )
+  )");
+  auto* method = get_fresh_method("dont_dedup_kotlin_intrinsics_throw_helper");
+  method->set_code(std::move(input_code));
+  auto* code = method->get_code();
+
+  run_dedup_blocks();
+
+  // The two invoke-static blocks differ only in the const-string they pass.
+  // Even though the (invoke-static + return-void) tail is byte-identical, it
+  // must NOT be merged because each call-site's PC is the throw-site that
+  // surfaces in the stack trace.
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (const-string "fieldA")
+      (move-result-pseudo-object v0)
+      (invoke-static (v0) "Lkotlin/jvm/internal/Intrinsics;.throwUninitializedPropertyAccessException:(Ljava/lang/String;)V")
+      (return-void)
+
+      (:lbl)
+      (const-string "fieldB")
+      (move-result-pseudo-object v0)
+      (invoke-static (v0) "Lkotlin/jvm/internal/Intrinsics;.throwUninitializedPropertyAccessException:(Ljava/lang/String;)V")
+      (return-void)
+    )
+  )");
+
+  EXPECT_CODE_EQ(expected_code.get(), code);
+}
+
+// Same protection applies to other Intrinsics throw* helpers (throwNpe is
+// emitted by Kotlin for `!!` non-null assertions).
+TEST_F(DedupBlocksTest, dont_dedup_kotlin_intrinsics_throw_npe) {
+  auto input_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (invoke-static () "Lkotlin/jvm/internal/Intrinsics;.throwNpe:()V")
+      (return-void)
+
+      (:lbl)
+      (invoke-static () "Lkotlin/jvm/internal/Intrinsics;.throwNpe:()V")
+      (return-void)
+    )
+  )");
+  auto* method = get_fresh_method("dont_dedup_kotlin_intrinsics_throw_npe");
+  method->set_code(std::move(input_code));
+  auto* code = method->get_code();
+
+  run_dedup_blocks();
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (invoke-static () "Lkotlin/jvm/internal/Intrinsics;.throwNpe:()V")
+      (return-void)
+
+      (:lbl)
+      (invoke-static () "Lkotlin/jvm/internal/Intrinsics;.throwNpe:()V")
+      (return-void)
+    )
+  )");
+
+  EXPECT_CODE_EQ(expected_code.get(), code);
+}
+
+// Redex's own UnreachableException.createAndThrow synthetic helper has the
+// same property and the same protection requirement.
+TEST_F(DedupBlocksTest, dont_dedup_redex_unreachable_create_and_throw) {
+  auto input_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (invoke-static () "Lcom/redex/UnreachableException;.createAndThrow:()Lcom/redex/UnreachableException;")
+      (move-result-object v0)
+      (throw v0)
+
+      (:lbl)
+      (invoke-static () "Lcom/redex/UnreachableException;.createAndThrow:()Lcom/redex/UnreachableException;")
+      (move-result-object v0)
+      (throw v0)
+    )
+  )");
+  auto* method =
+      get_fresh_method("dont_dedup_redex_unreachable_create_and_throw");
+  method->set_code(std::move(input_code));
+  auto* code = method->get_code();
+
+  run_dedup_blocks();
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (const v1 1)
+      (if-eqz v1 :lbl)
+
+      (invoke-static () "Lcom/redex/UnreachableException;.createAndThrow:()Lcom/redex/UnreachableException;")
+      (move-result-object v0)
+      (throw v0)
+
+      (:lbl)
+      (invoke-static () "Lcom/redex/UnreachableException;.createAndThrow:()Lcom/redex/UnreachableException;")
+      (move-result-object v0)
+      (throw v0)
+    )
+  )");
+
+  EXPECT_CODE_EQ(expected_code.get(), code);
+}
+
 // Don't dedup invocations to methods marked as dont-inline
 TEST_F(DedupBlocksTest, dont_dedup_dont_inline) {
   auto callee_code = assembler::ircode_from_string(R"(
@@ -2148,6 +2293,128 @@ TEST_F(DedupBlocksTest, splitPostfixPreservesSourceBlockCoverage) {
   code_ref.clear_cfg();
 }
 
+namespace {
+// The two duplicate arms of the diamond fixture both define v1; find them.
+std::vector<cfg::Block*> v1_defining_blocks(cfg::ControlFlowGraph& cfg) {
+  std::vector<cfg::Block*> out;
+  for (auto* b : cfg.blocks()) {
+    for (auto& mie : *b) {
+      if (mie.type == MFLOW_OPCODE && mie.insn->opcode() == OPCODE_CONST &&
+          mie.insn->dest() == 1) {
+        out.push_back(b);
+        break;
+      }
+    }
+  }
+  return out;
+}
+} // namespace
+
+// Golden: DedupBlocks folds two identical arms into one; the survivor's count
+// is the SUM of the merged duplicates (10 + 3 = 13), not the MAX (10). This is
+// the non-instrument path (`max`->`add`, M11).
+TEST_F(DedupBlocksTest, DedupMergesSourceBlockCountsBySum) {
+  auto input_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (if-eqz v0 :left)
+      (goto :right)
+      (:left)
+      (const v1 1)
+      (goto :middle)
+      (:right)
+      (const v1 1)
+      (:middle)
+      (return-void)
+    )
+  )");
+  auto* method = get_fresh_method("DedupMergesSourceBlockCountsBySum");
+  method->set_deobfuscated_name(show(method));
+  method->set_code(std::move(input_code));
+  auto* code = method->get_code();
+  code->build_cfg();
+  auto& cfg = code->cfg();
+
+  auto arms = v1_defining_blocks(cfg);
+  ASSERT_EQ(arms.size(), 2u);
+  std::sort(arms.begin(), arms.end(),
+            [](cfg::Block* a, cfg::Block* b) { return a->id() < b->id(); });
+  const std::array<float, 2> vals = {10.0f, 3.0f};
+  for (size_t i = 0; i < 2; i++) {
+    auto sb = std::make_unique<SourceBlock>(
+        method->get_deobfuscated_name_or_null(), arms[i]->id(),
+        std::vector<SourceBlock::Val>{SourceBlock::Val(vals[i], 100.0f)});
+    source_blocks::impl::BlockAccessor::push_source_block(arms[i],
+                                                          std::move(sb));
+  }
+
+  dedup_blocks_impl::Config config;
+  dedup_blocks_impl::DedupBlocks impl(&config, method);
+  impl.run();
+
+  auto survivors = v1_defining_blocks(cfg);
+  ASSERT_EQ(survivors.size(), 1u); // the two arms merged into one
+  auto* sb = source_blocks::get_first_source_block(survivors[0]);
+  ASSERT_NE(sb, nullptr);
+  EXPECT_FLOAT_EQ(sb->get_val(0).value_or(-1.0f), 13.0f); // SUM, not MAX (10)
+}
+
+// Binary-NFC: on today's 0/1 data the same merge preserves support (`add>0` iff
+// `max>0`) -- the merged arm stays covered and no surviving SB is zeroed.
+TEST_F(DedupBlocksTest, DedupSourceBlockMergeIsBinaryNfc) {
+  auto input_code = assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (if-eqz v0 :left)
+      (goto :right)
+      (:left)
+      (const v1 1)
+      (goto :middle)
+      (:right)
+      (const v1 1)
+      (:middle)
+      (return-void)
+    )
+  )");
+  auto* method = get_fresh_method("DedupSourceBlockMergeIsBinaryNfc");
+  method->set_deobfuscated_name(show(method));
+  method->set_code(std::move(input_code));
+  auto* code = method->get_code();
+  code->build_cfg();
+  auto& cfg = code->cfg();
+
+  // Boolean data: every block covered at val = 1.
+  for (auto* b : cfg.blocks()) {
+    if (b == cfg.exit_block()) {
+      continue;
+    }
+    auto sb = std::make_unique<SourceBlock>(
+        method->get_deobfuscated_name_or_null(), b->id(),
+        std::vector<SourceBlock::Val>{SourceBlock::Val(1.0f, 1.0f)});
+    source_blocks::impl::BlockAccessor::push_source_block(b, std::move(sb));
+  }
+
+  dedup_blocks_impl::Config config;
+  dedup_blocks_impl::DedupBlocks impl(&config, method);
+  impl.run();
+
+  // Support preserved: no surviving SB is zeroed, and the merged arm is covered
+  // (val = 1 + 1 = 2 > 0 -- the point is `>0`, not the magnitude).
+  auto survivors = v1_defining_blocks(cfg);
+  ASSERT_EQ(survivors.size(), 1u);
+  auto* merged = source_blocks::get_first_source_block(survivors[0]);
+  ASSERT_NE(merged, nullptr);
+  EXPECT_GT(merged->get_val(0).value_or(-1.0f), 0.0f); // still covered
+  for (auto* b : cfg.blocks()) {
+    source_blocks::foreach_source_block(b, [&](SourceBlock* sb) {
+      auto v = sb->get_val(0);
+      if (v) {
+        EXPECT_GT(*v, 0.0f) << "a covered SB was zeroed by the merge";
+      }
+    });
+  }
+}
+
 // Verify that normal dedup behavior (postfix deduplication) is not regressed
 // by the source block coverage fix.
 TEST_F(DedupBlocksTest, splitPostfixNormalBehaviorPreserved) {
@@ -2196,4 +2463,181 @@ TEST_F(DedupBlocksTest, splitPostfixNormalBehaviorPreserved) {
   )";
   auto expected_code = assembler::ircode_from_string(expected_str);
   EXPECT_CODE_EQ(expected_code.get(), method->get_code());
+}
+
+// A Remark must be transparent to DedupBlocks' merge decision: two blocks that
+// are structurally identical except for their redex-internal remark must merge
+// exactly as they would with no remark present, and the discarded duplicate's
+// remark must not survive. Guards structural_equals/is_metadata transparency
+// and the remove_instructions MFLOW_REMARK handling.
+TEST_F(DedupBlocksTest, remarksAreTransparentToWholeBlockMerge) {
+  DexMethod* with = get_fresh_method("remarksMergeWith");
+  with->set_code(assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (mul-int v0 v0 v0)
+      (if-eqz v0 :D)
+
+      (mul-int v0 v0 v0)
+      (goto :C)
+
+      (:E)
+      (return-void)
+
+      (:C)
+      (.remark "P" "c" 1)
+      (add-int v0 v0 v0)
+      (goto :E)
+
+      (:D)
+      (.remark "P" "d" 2)
+      (add-int v0 v0 v0)
+      (goto :E)
+    )
+  )"));
+
+  DexMethod* without = get_fresh_method("remarksMergeWithout");
+  without->set_code(assembler::ircode_from_string(R"(
+    (
+      (const v0 0)
+      (mul-int v0 v0 v0)
+      (if-eqz v0 :D)
+
+      (mul-int v0 v0 v0)
+      (goto :C)
+
+      (:E)
+      (return-void)
+
+      (:C)
+      (add-int v0 v0 v0)
+      (goto :E)
+
+      (:D)
+      (add-int v0 v0 v0)
+      (goto :E)
+    )
+  )"));
+
+  run_dedup_blocks();
+
+  // Opcodes/structure must be identical with and without the remarks;
+  // structural_equals ignores metadata (incl. remarks), so this asserts the
+  // merge decision was unaffected by the differing remarks.
+  EXPECT_TRUE(with->get_code()->structural_equals(*without->get_code()));
+
+  // The merged-away duplicate's remark is gone; exactly one remark survives.
+  size_t remarks = 0;
+  for (const auto& mie : *with->get_code()) {
+    if (mie.type == MFLOW_REMARK) {
+      ++remarks;
+    }
+  }
+  EXPECT_EQ(remarks, 1u);
+}
+
+// Regression test for the remark-transparency of split_postfix source-block
+// restoration. A leading MFLOW_REMARK at a split boundary must not derail the
+// restoration: the pre-fix code did split_block->begin()->insn->opcode() and
+// keyed off begin()->type, both of which misread a leading remark (the MIE
+// union aliases IRInstruction* with unique_ptr<Remark>). Mirrors
+// splitPostfixPreservesSourceBlockCoverage, but places a remark immediately
+// before the throw-delineated source block so it heads the moved segment.
+TEST_F(DedupBlocksTest, splitPostfixSourceBlockRestorationSkipsLeadingRemark) {
+  DexMethod* method =
+      get_fresh_method("splitPostfixSourceBlockRestorationSkipsLeadingRemark");
+  method->set_deobfuscated_name(show(method));
+
+  const auto* str = R"(
+    (
+      (const v0 0)
+      (if-eqz v0 :C)
+
+      (invoke-static () "LFoo;.bar:()V")
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return-void)
+
+      (:C)
+      (const v1 1)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return-void)
+    )
+  )";
+  method->set_code(assembler::ircode_from_string(str));
+
+  auto& code_ref = *method->get_code();
+  code_ref.build_cfg();
+  auto& cfg = code_ref.cfg();
+
+  // A source block at every non-exit block head.
+  for (auto* block : cfg.blocks()) {
+    if (block == cfg.exit_block()) {
+      continue;
+    }
+    auto sb = std::make_unique<SourceBlock>(
+        method->get_deobfuscated_name_or_null(), block->id(),
+        std::vector<SourceBlock::Val>{SourceBlock::Val(1.0f, 1.0f)});
+    source_blocks::impl::BlockAccessor::push_source_block(block, std::move(sb));
+  }
+
+  // A second source block after the may-throw invoke, with a remark placed
+  // immediately BEFORE it so the throw-delineated segment begins [remark, sb].
+  const auto* producer = DexString::make_string("P");
+  const auto* val_str = DexString::make_string("");
+  for (auto* block : cfg.blocks()) {
+    for (auto it = block->begin(); it != block->end(); ++it) {
+      if (it->type == MFLOW_OPCODE &&
+          it->insn->opcode() == OPCODE_INVOKE_STATIC) {
+        auto* first_sb = source_blocks::get_first_source_block(block);
+        if (first_sb != nullptr) {
+          auto sb_after = std::make_unique<SourceBlock>(*first_sb);
+          sb_after->id = 100;
+          sb_after->next = nullptr;
+          source_blocks::impl::BlockAccessor::insert_source_block_after(
+              block, it, std::move(sb_after));
+          // Put the remark between the invoke and sb@100 so it leads the moved
+          // segment after the split.
+          block->insert_before(std::next(IRList::iterator(it)),
+                               std::make_unique<Remark>(producer, val_str, 7));
+        }
+        break;
+      }
+    }
+  }
+
+  dedup_blocks_impl::Config config;
+  dedup_blocks_impl::DedupBlocks impl(&config, method);
+  impl.run();
+
+  // Every non-exit block still has source-block coverage, and any may-throw
+  // block still has a source block after the throwing instruction -- proving
+  // the leading remark did not derail restoration (and did not crash on the
+  // union).
+  for (auto* block : cfg.blocks()) {
+    if (block == cfg.exit_block()) {
+      continue;
+    }
+    EXPECT_NE(source_blocks::get_first_source_block(block), nullptr)
+        << "Block B" << block->id() << " missing source block";
+
+    auto last_it = block->get_last_insn();
+    if (last_it != block->end() && opcode::can_throw(last_it->insn->opcode())) {
+      bool found_sb_after = false;
+      for (auto check_it = std::next(IRList::iterator(last_it));
+           check_it != block->end();
+           ++check_it) {
+        if (check_it->type == MFLOW_SOURCE_BLOCK) {
+          found_sb_after = true;
+          break;
+        }
+      }
+      EXPECT_TRUE(found_sb_after)
+          << "Block B" << block->id()
+          << " missing source block after may-throw instruction";
+    }
+  }
+
+  code_ref.clear_cfg();
 }

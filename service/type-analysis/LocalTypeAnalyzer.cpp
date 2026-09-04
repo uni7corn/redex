@@ -7,9 +7,7 @@
 
 #include "LocalTypeAnalyzer.h"
 
-#include <ostream>
-#include <sstream>
-
+#include "Debug.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "Trace.h"

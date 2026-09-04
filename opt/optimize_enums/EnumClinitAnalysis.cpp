@@ -8,7 +8,9 @@
 #include "EnumClinitAnalysis.h"
 
 #include "ConstantPropagationAnalysis.h"
-#include "DexUtil.h"
+#include "Debug.h"
+#include "DeterministicContainers.h"
+#include "DexAccess.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "Trace.h"
@@ -264,7 +266,6 @@ EnumAttributes analyze_enum_clinit(const DexClass* cls,
   always_assert(code->cfg_built());
   auto& cfg = code->cfg();
   auto fp_iter = std::make_unique<cp::intraprocedural::FixpointIterator>(
-      /* cp_state */ nullptr,
       cfg,
       CombinedAnalyzer(cls->get_type(), nullptr, nullptr, nullptr, nullptr,
                        nullptr));

@@ -49,7 +49,6 @@ class DexOutputIdx {
   std::vector<DexTypeList*> m_typelist;
   dexcallsite_to_idx m_callsite;
   dexmethodhandle_to_idx m_methodhandle;
-  const uint8_t* m_base;
 
  public:
   DexOutputIdx(dexstring_to_idx string,
@@ -59,8 +58,7 @@ class DexOutputIdx {
                dexmethod_to_idx method,
                std::vector<DexTypeList*> typelist,
                dexcallsite_to_idx callsite,
-               dexmethodhandle_to_idx methodhandle,
-               const uint8_t* base)
+               dexmethodhandle_to_idx methodhandle)
       : m_string(std::move(string)),
         m_type(std::move(type)),
         m_proto(std::move(proto)),
@@ -68,8 +66,7 @@ class DexOutputIdx {
         m_method(std::move(method)),
         m_typelist(std::move(typelist)),
         m_callsite(std::move(callsite)),
-        m_methodhandle(std::move(methodhandle)),
-        m_base(base) {}
+        m_methodhandle(std::move(methodhandle)) {}
 
   DexOutputIdx(const DexOutputIdx&) = delete;
   DexOutputIdx& operator=(const DexOutputIdx&) = delete;
@@ -105,10 +102,6 @@ class DexOutputIdx {
   size_t methodsize() const { return m_method.size(); }
   size_t callsitesize() const { return m_callsite.size(); }
   size_t methodhandlesize() const { return m_methodhandle.size(); }
-
-  uint32_t get_offset(uint8_t* ptr) { return (uint32_t)(ptr - m_base); }
-
-  uint32_t get_offset(uint32_t* ptr) { return get_offset((uint8_t*)ptr); }
 };
 
 class IODIMetadata;
@@ -116,10 +109,14 @@ class GatheredTypes;
 
 struct enhanced_dex_stats_t : public dex_stats_t {
   UnorderedMap<const DexClass*, size_t> class_size;
+  // Authoritative post-lowering per-method code_item byte size (return of
+  // DexMethod code->encode()); populated only when write_method_sizes is set.
+  UnorderedMap<const DexMethod*, size_t> method_size;
 
   enhanced_dex_stats_t& operator+=(const enhanced_dex_stats_t& rhs) {
     dex_stats_t::operator+=(rhs);
     insert_unordered_iterable(class_size, rhs.class_size);
+    insert_unordered_iterable(method_size, rhs.method_size);
     return *this;
   }
 };
@@ -246,7 +243,7 @@ class GatheredTypes {
  public:
   explicit GatheredTypes(DexClasses* classes);
 
-  DexOutputIdx get_dodx(const uint8_t* base);
+  DexOutputIdx get_dodx();
   template <class T = decltype(compare_dexstrings)>
   std::vector<const DexString*> get_dexstring_emitlist(
       T cmp = compare_dexstrings);
@@ -308,6 +305,8 @@ class DexOutput {
 
  private:
   DexClasses* m_classes;
+  // The ALLOCATION -- the configured dex_output_buffer_size plus
+  // k_output_margin. Not the size policy: that is policy_cap(), below.
   const size_t m_output_size;
   std::unique_ptr<uint8_t[]> m_output;
   std::shared_ptr<GatheredTypes> m_gtypes;
@@ -382,7 +381,16 @@ class DexOutput {
   uint32_t align(uint32_t offset) { return (offset + 3) & ~3; }
   void align_output() { m_offset = align(m_offset); }
 
-  void inc_offset(uint32_t v);
+  void inc_offset(uint64_t v);
+
+  // The size policy the cursor is held below, as distinct from the allocation.
+  // Derived rather than stored so the two cannot drift apart.
+  uint64_t policy_cap() const;
+
+  // Aborts unless `bytes` can be written at the current cursor. Every producer
+  // that advances a raw pointer with no notion of an end goes through this
+  // first; adding one means calling it.
+  void ensure_fits(uint64_t bytes, const char* what, const char* subject) const;
 
   friend struct DexOutputTestHelper;
 

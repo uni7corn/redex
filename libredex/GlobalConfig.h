@@ -36,7 +36,7 @@ struct IRTypeCheckerConfig : public Configurable {
   bool verify_moves{true};
   bool validate_invoke_super{true};
   bool check_no_overwrite_this{false};
-  bool annotated_cfg_on_error{false};
+  bool annotated_cfg_on_error{true};
   bool annotated_cfg_on_error_reduced{true};
   bool check_classes{true};
   bool run_on_input{true};
@@ -165,10 +165,31 @@ struct PassManagerConfig : public Configurable {
 
   UnorderedMap<std::string, std::string> pass_aliases;
   bool jemalloc_full_stats{false};
-  bool violations_tracking{false};
   bool check_pass_order_properties{false};
   bool check_properties_deep{false};
   bool dump_mrefs{false};
+};
+
+struct ViolationsTrackingConfig : public Configurable {
+  void bind_config() override;
+
+  std::string get_config_name() override { return "ViolationsTrackingConfig"; }
+  std::string get_config_doc() override {
+    return "Controls the source-block violations tracking that runs around "
+           "every pass, reporting how many violations each pass introduces.";
+  }
+
+  bool enabled{false};
+  // Names as spelled by source_blocks::get_violation_name.
+  std::vector<std::string> violation_kinds{"ChainAndDom"};
+  unsigned int top_n{10};
+  std::vector<std::string> methods_to_vis;
+  // "<method>@<id>" descriptors, or a bare "<method>" for every block
+  // attributed to it. Non-empty switches on targeted mode.
+  std::vector<std::string> source_blocks_to_track;
+  bool track_intermethod_violations{false};
+  bool print_all_violations{false};
+  bool ignore_undefined{false};
 };
 
 struct ResourceConfig : public Configurable {
@@ -201,6 +222,21 @@ struct DexOutputConfig : public Configurable {
   }
 
   bool write_class_sizes{false};
+
+  // When enabled, record the authoritative post-lowering per-method code_item
+  // byte size (return of DexMethod code->encode()) into
+  // enhanced_dex_stats_t::method_size. Forced on by --emit-dexvt.
+  bool write_method_sizes{false};
+
+  // When enabled, emit a segment-aware, sampled class-placement fingerprint for
+  // root-store (main-APK) classes into output_stats.class_order_sample, used to
+  // compare class placement across two builds per dex-ordering regime. On by
+  // default.
+  bool emit_class_order_sample{true};
+  // Target number of sampled classes in the cold (cross-dex-ref-minimized)
+  // segment when emit_class_order_sample is set; the primary and betamap
+  // segments are always kept in full, so this only bounds the cold segment.
+  int class_order_sample_cap{1000};
 };
 
 struct JarLoaderConfig : public Configurable {

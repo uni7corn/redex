@@ -10,10 +10,12 @@
 #include <optional>
 
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexClass.h"
 #include "GraphUtil.h"
 #include "RedexContext.h"
 #include "Show.h"
+#include "SourceBlocks.h"
 #include "Trace.h"
 
 namespace {
@@ -164,8 +166,9 @@ bool is_insn_eligible(const IRInstruction* insn) {
 // Other types will block hoisting further instructions.
 void skip_handled_method_item_entries(IRList::iterator& it,
                                       const IRList::iterator& end) {
-  while (it != end && (it->type == MFLOW_POSITION || it->type == MFLOW_DEBUG ||
-                       it->type == MFLOW_SOURCE_BLOCK)) {
+  while (it != end &&
+         (it->type == MFLOW_POSITION || it->type == MFLOW_DEBUG ||
+          it->type == MFLOW_SOURCE_BLOCK || it->type == MFLOW_REMARK)) {
     it++;
   }
 }
@@ -395,6 +398,8 @@ size_t hoist_insns_for_block(
       [](const auto& insn) { return opcode::can_throw(insn.opcode()); });
 
   DexPosition* last_position = nullptr;
+  // The hoisted prefix needs at most one SourceBlock, not one per successor.
+  bool hoisted_source_block_inserted = false;
   for (const auto& insn : insns_to_hoist) {
     // Check if any source blocks or positions precede instructions.
     if (!opcode::is_move_result_any(insn.opcode())) {
@@ -447,12 +452,45 @@ size_t hoist_insns_for_block(
             // instructions throw, we can be sure that one of the successor
             // blocks will be hit and the profiling will work correctly.
             if (any_throw && !g_redex->instrument_mode) {
-              cfg.insert_before(insert_it,
-                                std::make_unique<SourceBlock>(*it->src_block));
+              if (!g_redex->preserve_count_integrity) {
+                cfg.insert_before(
+                    insert_it, std::make_unique<SourceBlock>(*it->src_block));
+              } else if (!hoisted_source_block_inserted) {
+                // The hoisted instructions now live in this block, so they run
+                // exactly as often as it does -- whatever the successors they
+                // came from ran. Emit one SourceBlock carrying this block's own
+                // count, rather than a verbatim copy of every successor's,
+                // which left the prefix annotated N times over, each claiming
+                // the whole of it.
+                //
+                // Same trigger as before: only when a successor actually had a
+                // leading SourceBlock to hoist.
+                auto* block_sb = source_blocks::get_last_source_block(block);
+                if (block_sb != nullptr) {
+                  cfg.insert_before(
+                      insert_it, source_blocks::clone_as_synthetic(block_sb));
+                } else {
+                  // No count of our own to attribute the prefix to. Fall back
+                  // to the verbatim copy rather than leaving the hoisted code
+                  // with no SourceBlock at all: keeping the new control flow
+                  // covered is the reason this copy exists, and a count that
+                  // over-attributes beats no annotation.
+                  cfg.insert_before(
+                      insert_it, std::make_unique<SourceBlock>(*it->src_block));
+                }
+                // Set on BOTH paths: the fallback also annotates the prefix, so
+                // leaving it unset would let the next successor's SourceBlock
+                // re-enter and annotate a second time.
+                hoisted_source_block_inserted = true;
+              }
             }
             break;
           case MFLOW_POSITION:
             last_position = it->pos.get();
+            break;
+          case MFLOW_REMARK:
+            // Block-anchored metadata; leave remarks in the block (not
+            // hoisted).
             break;
           default:
             not_reached();
@@ -503,7 +541,7 @@ size_t hoist_insns_for_block(
     const auto& end = p.second;
     for (auto it = p.first->begin(); it != end; ++it) {
       redex_assert(it->type == MFLOW_DEBUG || it->type == MFLOW_POSITION ||
-                   it->type == MFLOW_SOURCE_BLOCK);
+                   it->type == MFLOW_SOURCE_BLOCK || it->type == MFLOW_REMARK);
     }
   }
 

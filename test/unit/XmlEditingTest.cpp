@@ -7,7 +7,6 @@
 
 #include <gtest/gtest.h>
 #include <limits>
-#include <unordered_set>
 
 #include "androidfw/ResourceTypes.h"
 #include "utils/Serialize.h"

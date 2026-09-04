@@ -13,6 +13,7 @@
 #include "CFGMutation.h"
 #include "ConstantPropagationAnalysis.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexAnnotation.h"
 #include "DexInstruction.h"
 #include "DexUtil.h"
@@ -273,8 +274,7 @@ FieldArrayValues RClassReader::analyze_clinit(
   cfg.calculate_exit_block();
 
   cp::intraprocedural::FixpointIterator intra_cp(
-      /* cp_state */ nullptr, cfg,
-      ArrayAnalyzer(cls->get_type(), nullptr, nullptr, nullptr));
+      cfg, ArrayAnalyzer(cls->get_type(), nullptr, nullptr, nullptr));
   intra_cp.run(ConstantEnvironment());
 
   Lazy<live_range::UseDefChains> udchain(

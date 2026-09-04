@@ -12,6 +12,7 @@
 #include "CFGMutation.h"
 #include "ControlFlow.h"
 #include "Creators.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexAsm.h"
 #include "DexClass.h"
@@ -138,9 +139,8 @@ struct EnumUtil {
       "StringBuilder;");
   DexMethodRef* STRING_HASHCODE_METHOD =
       DexMethod::make_method("Ljava/lang/String;.hashCode:()I");
-  DexMethodRef* STRINGBUILDER_APPEND_STR_METHOD = DexMethod::make_method(
-      "Ljava/lang/StringBuilder;.append:(Ljava/lang/String;)Ljava/lang/"
-      "StringBuilder;");
+  DexMethodRef* STRINGBUILDER_APPEND_STR_METHOD =
+      method::java_lang_StringBuilder_append_String();
   DexMethodRef* INTEGER_INTVALUE_METHOD = method::java_lang_Integer_intValue();
   DexMethodRef* INTEGER_EQUALS_METHOD = DexMethod::make_method(
       "Ljava/lang/Integer;.equals:(Ljava/lang/Object;)Z");
@@ -185,10 +185,9 @@ struct EnumUtil {
               value = std::move(synthetic_block);
             }
           } else if (prev_sb != nullptr) {
-            // TODO: When hit counts are introduced, max will no longer be
-            // accurate. Once hit counts are introduced, this will need to
-            // modified.
-            value->max(*prev_sb);
+            // Distinct candidate methods' source blocks accumulate into the one
+            // substitute method, so their counts must sum (appear100 maxes).
+            value->add(*prev_sb);
           }
         });
   }

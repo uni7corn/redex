@@ -8,6 +8,7 @@
 #pragma once
 
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include "BaselineProfile.h"
@@ -111,6 +112,24 @@ struct InlinerCostConfig {
   float profile_guided_heat_discount;
   float profile_guided_shrink_bias;
   float profile_guided_block_appear_threshold;
+
+  // [experimental] Callsite-count-percentile inlining lever. Rank percentiles,
+  // high = hot: p95 is the hottest 5% of profiled (positive-count) callsites.
+  //
+  //   d(p) = d_start * (d_top/d_start) ^ clamp((p-p_start)/(p_top-p_start),0,1)
+  //
+  // A callsite at or above p_start has its local inline cost scaled by d(p), so
+  // hot callsites inline callees the flat cost model would reject. Geometric,
+  // so equal percentile steps are equal cost ratios -- the right spacing for a
+  // factor that composes multiplicatively with the baseline-profile discounts
+  // above.
+  //
+  // With p_top unset the ramp degenerates to a flat step at d_start for every
+  // callsite above p_start. p_start <= 0 disables the lever entirely (NFC).
+  int inline_hot_callsite_count_percentile; // p_start
+  float inline_hot_callsite_count_discount; // d_start, at p_start
+  int inline_hot_callsite_count_top_percentile; // p_top
+  float inline_hot_callsite_count_top_discount; // d_top, the cap
 };
 
 inline const struct InlinerCostConfig DEFAULT_COST_CONFIG = {
@@ -148,6 +167,10 @@ inline const struct InlinerCostConfig DEFAULT_COST_CONFIG = {
     1.0f, // profile_guided_heat_discount
     0.0f, // profile_guided_shrink_bias
     0.0f, // profile_guided_block_appear_threshold
+    -1, // inline_hot_callsite_count_percentile
+    1.0f, // inline_hot_callsite_count_discount
+    -1, // inline_hot_callsite_count_top_percentile
+    -1.0f, // inline_hot_callsite_count_top_discount
 };
 
 // All call-sites of a callee.
@@ -160,11 +183,6 @@ struct CallerInsns {
   bool other_call_sites{false};
   bool other_call_sites_overriding_methods_added{false};
   bool empty() const { return caller_insns.empty() && !other_call_sites; }
-};
-
-struct Callee {
-  DexMethod* method;
-  bool true_virtual;
 };
 
 using CalleeCallerInsns = UnorderedMap<DexMethod*, CallerInsns>;
@@ -410,7 +428,32 @@ class MultiMethodInliner {
   bool get_needs_constructor_fence(const DexMethod* caller,
                                    const DexMethod* callee) const;
 
-  std::optional<Callee> get_callee(DexMethod* caller, IRInstruction* insn);
+  /**
+   * The method that `insn` invokes, or std::nullopt if we must not inline at
+   * `insn` at all. For a callsite that the true-virtual analysis registered,
+   * that is the unique implementation it found. Otherwise it is the resolved
+   * method, which is inlinable only if it is also in `caller`'s callee set,
+   * where plain resolution puts overrideless candidates alone. Either way the
+   * result is the implementation that actually runs, which is what makes it
+   * sound to inline (part of) its body.
+   */
+  std::optional<DexMethod*> get_callee(DexMethod* caller, IRInstruction* insn);
+
+  /**
+   * The type the true-virtual analysis recorded for `insn`'s receiver to be
+   * cast to on the way into the inlined code, or nullptr if it recorded none.
+   */
+  const DexType* get_recorded_receiver_cast(IRInstruction* insn) const;
+
+  /**
+   * Whether a plain invocation of `callee`, as the partially inlined code's
+   * fallback performs it, can stand in for `insn`. It must dispatch the same
+   * way, and, as it names `callee` where `insn` names its own method ref, the
+   * receiver must be an instance of the callee's class by the time it reaches
+   * the fallback.
+   */
+  bool can_invoke_callee_directly(IRInstruction* insn,
+                                  const DexMethod* callee) const;
 
   size_t inline_inlinables(DexMethod* caller,
                            const std::vector<Inlinable>& inlinables);
@@ -558,11 +601,11 @@ class MultiMethodInliner {
       PartialCode* partial_code = nullptr);
 
   /**
-   * Whether we should partially inline a particular callee.
+   * Whether we should, and legally can, partially inline a particular callee
+   * at a particular callsite.
    */
   bool should_partially_inline(cfg::Block* block,
                                IRInstruction* insn,
-                               bool true_virtual,
                                DexMethod* callee,
                                PartialCode* partial_code);
 
@@ -700,6 +743,14 @@ class MultiMethodInliner {
                                         cfg::Block* caller_block,
                                         ReducedCode* reduced_callee);
 
+  // Builds the count -> discount ramp (entry cutoff, quantile table, and the
+  // discount at each quantile). Called once at construction.
+  void build_hot_callsite_count_ramp();
+
+  // Discount for a callsite whose block execution count is `count`; 1.0 when
+  // the lever is off or the callsite is below p_start.
+  float hot_callsite_count_discount(float count) const;
+
   const api::AndroidSDK* m_min_sdk_api;
 
   std::unique_ptr<InsertOnlyConcurrentMap<size_t, RefChecker>> m_ref_checkers;
@@ -755,6 +806,9 @@ class MultiMethodInliner {
   // Mapping from callers to auxiliary data for contained true virtual callees
   UnorderedMap<const DexMethod*, CallerVirtualCallees> m_caller_virtual_callees;
 
+  // Casts that a partially-inlined fallback invocation needs, keyed by invoke
+  // instruction. Flattened from the per-callee CallerInsns, so each callee
+  // contributes its whole map once, not once per caller.
   UnorderedMap<IRInstruction*, const DexType*> m_inlined_invokes_need_cast;
 
   UnorderedSet<const DexMethod*> m_true_virtual_callees_with_other_call_sites;
@@ -922,6 +976,19 @@ class MultiMethodInliner {
   std::optional<baseline_profiles::BaselineProfile> m_baseline_profile;
 
   InlinerCostConfig m_inliner_cost_config;
+
+  // Entry cutoff for the callsite-count lever: the count at p_start, computed
+  // once at construction when the lever is enabled; +inf otherwise (nothing
+  // qualifies).
+  float m_hot_callsite_count_cutoff{std::numeric_limits<float>::infinity()};
+  // Ascending quantile table of profiled callsite block counts: entry i is the
+  // count at rank percentile 100*i/(N-1). Empty when the lever is off or no
+  // ramp is configured. Fixed size, so the per-callsite rank lookup is a binary
+  // search over a few thousand floats, not over the whole scope.
+  std::vector<float> m_hot_callsite_count_quantiles;
+  // Discount per quantile bucket, precomputed so the hot path does no
+  // transcendentals. Parallel to m_hot_callsite_count_quantiles.
+  std::vector<float> m_hot_callsite_count_discounts;
 
   const UnorderedSet<const DexMethod*>* m_unfinalized_init_methods;
   InsertOnlyConcurrentMap<const DexMethod*, const DexMethod*>

@@ -69,6 +69,10 @@ extern bool enable_replacing_areequal;
 namespace constant_propagation {
 // TODO(T257927964): Remove this.
 extern bool known_non_null_returns_enable;
+// TODO(T275196808): Remove this.
+extern bool enable_param_exit_value_summary;
+// TODO(T279417132): Remove this.
+extern bool enable_check_cast_value_preservation;
 } // namespace constant_propagation
 
 struct RedexTest : public testing::Test {
@@ -83,6 +87,10 @@ struct RedexTest : public testing::Test {
     constant_propagation_transform_internal::enable_replacing_areequal = true;
     // TODO(T257927964): Remove this.
     constant_propagation::known_non_null_returns_enable = true;
+    // TODO(T275196808): Remove this.
+    constant_propagation::enable_param_exit_value_summary = true;
+    // TODO(T279417132): Remove this.
+    constant_propagation::enable_check_cast_value_preservation = true;
   }
 
   ~RedexTest() { delete g_redex; }

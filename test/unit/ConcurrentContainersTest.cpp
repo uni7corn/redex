@@ -6,9 +6,10 @@
  */
 
 #include "ConcurrentContainers.h"
+#include "Debug.h"
 
 #include <algorithm>
-#include <boost/thread.hpp>
+#include <boost/thread.hpp> // NOLINT(facebook-unused-include-check): boost::thread is used
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -44,6 +45,7 @@ class ConcurrentContainersTest : public ::testing::Test {
 
   std::vector<uint32_t> generate_random_data() {
     std::vector<uint32_t> s;
+    s.reserve(m_size);
     for (size_t i = 0; i < m_size; ++i) {
       s.push_back(m_elem_dist(m_generator));
     }
@@ -53,7 +55,8 @@ class ConcurrentContainersTest : public ::testing::Test {
   std::vector<uint32_t> generate_random_subset(
       const std::vector<uint32_t>& data) {
     auto new_data = data;
-    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+    unsigned seed = static_cast<unsigned>(
+        std::chrono::system_clock::now().time_since_epoch().count());
     std::shuffle(
         new_data.begin(), new_data.end(), std::default_random_engine(seed));
     new_data.erase(new_data.begin(), new_data.begin() + m_size / 2);
@@ -154,6 +157,30 @@ TEST_F(ConcurrentContainersTest, concurrentSetTest) {
   EXPECT_EQ(0, set.size());
 }
 
+// End-to-end wrapper check: iterating a populated ConcurrentSet (via
+// UnorderedIterable, which concatenates its shards) visits every inserted
+// element exactly once and skips none, regardless of perturbation. Confirms the
+// public wrapper composes the shard tables (perturbed under
+// REDEX_PERTURB_UNORDERED) correctly.
+TEST_F(ConcurrentContainersTest, unorderedIterableVisitsEveryElementOnce) {
+  ConcurrentSet<uint32_t> set;
+  run_on_samples([&set](const std::vector<uint32_t>& sample) {
+    for (uint32_t x : sample) {
+      set.insert(x);
+    }
+  });
+  ASSERT_EQ(m_data_set.size(), set.size());
+
+  std::unordered_set<uint32_t> seen;
+  size_t count = 0;
+  for (uint32_t x : UnorderedIterable(set)) {
+    EXPECT_TRUE(seen.insert(x).second) << "element visited twice: " << x;
+    ++count;
+  }
+  EXPECT_EQ(set.size(), count);
+  EXPECT_EQ(m_data_set, seen);
+}
+
 TEST_F(ConcurrentContainersTest, insertOnlyConcurrentSetTest) {
   InsertOnlyConcurrentSet<uint32_t> set;
 
@@ -204,6 +231,8 @@ TEST_F(ConcurrentContainersTest, insertOnlyConcurrentSetTest) {
 
   for (uint32_t x : m_subset_data) {
     const uint32_t* p = moved.insert(x).first;
+    ASSERT_NE(nullptr, p);
+    // @lint-ignore NULLSAFECLANG (guarded by ASSERT_NE above)
     EXPECT_EQ(*p, x);
     pointers.push_back(Pair{p, x});
   }
@@ -218,6 +247,8 @@ TEST_F(ConcurrentContainersTest, insertOnlyConcurrentSetTest) {
   EXPECT_EQ(m_data_set.size(), moved.size());
 
   for (const auto& pair : pointers) {
+    ASSERT_NE(nullptr, pair.p);
+    // @lint-ignore NULLSAFECLANG (guarded by ASSERT_NE above)
     EXPECT_EQ(*pair.p, pair.x);
     EXPECT_EQ(pair.p, moved.insert(pair.x).first);
     EXPECT_EQ(pair.p, moved.get(pair.x));
@@ -366,6 +397,39 @@ TEST_F(ConcurrentContainersTest, insertOnlyConcurrentMapTest) {
   EXPECT_EQ(m_data_set.size(), map.size());
 }
 
+// Regression: the rvalue-key overload of get_or_create_and_assert_equal must
+// not move `key` into the creator and then again into the map. A creator that
+// consumes its argument by value would otherwise leave a moved-from key stored.
+TEST_F(ConcurrentContainersTest, getOrCreateRvalueKeyIsNotMovedFrom) {
+  InsertOnlyConcurrentMap<std::string, size_t> map;
+  // Long enough to defeat small-string optimization, so a moved-from husk is
+  // reliably distinct from the original key.
+  const std::string original = "a_reasonably_long_key_that_avoids_sso_buffer";
+
+  std::string key = original;
+  auto [ptr, created] =
+      map.get_or_create_and_assert_equal(std::move(key), [](std::string k) {
+        // Genuinely consume the key by move: this models a consuming creator
+        // (a const-ref parameter would not reproduce the pre-fix double-move)
+        // and avoids performance-unnecessary-value-param.
+        const std::string consumed = std::move(k);
+        return consumed.size();
+      });
+
+  EXPECT_TRUE(created);
+  ASSERT_NE(ptr, nullptr);
+  EXPECT_EQ(original.size(), *ptr); // sanity check; the value is correct even
+                                    // with the bug (the creator sees the key
+                                    // before it is stored).
+  // These are the assertions that distinguish buggy from fixed: with the
+  // double-move the stored key is a moved-from husk, so a lookup of the
+  // original key fails.
+  EXPECT_EQ(1, map.count(original));
+  auto it = map.find(original);
+  ASSERT_NE(map.end(), it);
+  EXPECT_EQ(original, it->first);
+}
+
 TEST_F(ConcurrentContainersTest, move) {
   ConcurrentMap<void*, void*> map1;
   map1.emplace(nullptr, nullptr);
@@ -396,7 +460,8 @@ TEST_F(ConcurrentContainersTest, insert_or_assign) {
   for (uint32_t x : m_data) {
     EXPECT_TRUE(map.count(x));
     auto& p = map.at_unsafe(x);
-    EXPECT_TRUE(p);
+    ASSERT_TRUE(p);
+    // @lint-ignore NULLSAFECLANG (guarded by ASSERT_TRUE above)
     EXPECT_EQ(x, *p);
   }
 
@@ -410,7 +475,8 @@ TEST_F(ConcurrentContainersTest, insert_or_assign) {
   for (uint32_t x : m_data) {
     EXPECT_TRUE(map.count(x));
     auto& p = map.at_unsafe(x);
-    EXPECT_TRUE(p);
+    ASSERT_TRUE(p);
+    // @lint-ignore NULLSAFECLANG (guarded by ASSERT_TRUE above)
     EXPECT_EQ(x + 1, *p);
   }
 }

@@ -407,6 +407,25 @@ std::vector<std::string> ConfigFiles::load_coldstart_classes() {
     TRACE(CF, 1, "coldstart class: 20 pct %zu", coldstart_20pct_classes.size());
     TRACE(CF, 1, "coldstart class: 1 pct %zu", coldstart_1pct_classes.size());
 
+    if (traceEnabled(CF, 3)) {
+      for (const auto* type : coldstart_20pct_classes) {
+        auto* appended_cls = type_class(type);
+        TRACE(CF, 3, "coldstart appended 20pct %s: %s",
+              (appended_cls && klass::maybe_anonymous_class(appended_cls))
+                  ? "anon"
+                  : "general",
+              type->c_str());
+      }
+      for (const auto* type : coldstart_1pct_classes) {
+        auto* appended_cls = type_class(type);
+        TRACE(CF, 3, "coldstart appended 1pct %s: %s",
+              (appended_cls && klass::maybe_anonymous_class(appended_cls))
+                  ? "anon"
+                  : "general",
+              type->c_str());
+      }
+    }
+
     std::vector<std::string> coldstart_classes_with_method_profile_symbols;
     coldstart_classes_with_method_profile_symbols.reserve(
         coldstart_classes.size() + coldstart_20pct_classes.size() +
@@ -503,18 +522,13 @@ ConfigFiles::load_class_lists() {
 
 const UnorderedMap<std::string, ConfigFiles::DeadClassLoadCounts>&
 ConfigFiles::get_dead_class_list() {
-  build_dead_class_and_live_class_split_lists();
+  build_dead_class_list();
   return m_dead_classes;
 }
 
 const std::vector<std::string>& ConfigFiles::get_halfnosis_block_list() {
   build_halfnosis_block_list();
   return m_halfnosis_block_list;
-}
-
-const UnorderedSet<std::string>& ConfigFiles::get_live_class_split_list() {
-  build_dead_class_and_live_class_split_lists();
-  return m_live_relocated_classes;
 }
 
 bool ConfigFiles::is_relocated_class(std::string_view name) const {
@@ -529,7 +543,7 @@ void ConfigFiles::remove_relocated_part(std::string_view* name) {
   name->remove_suffix(CLASS_SPLITTING_RELOCATED_SUFFIX_LEN);
 }
 
-void ConfigFiles::build_dead_class_and_live_class_split_lists() {
+void ConfigFiles::build_dead_class_list() {
   if (!m_dead_class_list_attempted) {
     m_dead_class_list_attempted = true;
     std::string dead_class_list_filename;
@@ -574,12 +588,6 @@ void ConfigFiles::build_dead_class_and_live_class_split_lists() {
         if (!is_relocated) {
           auto translated = m_proguard_map->translate_class(converted);
           m_dead_classes.emplace(std::move(translated), load_counts);
-        } else {
-          // No need to proguard translate the name of the live classes since
-          // we use the unobfuscated name. The unobfuscated name is already
-          // translated in ProguardMap.apply_deobfuscated_names called
-          // from redex_frontend in main.cpp.
-          m_live_relocated_classes.insert(std::move(converted));
         }
       }
     }
@@ -824,6 +832,10 @@ bool ConfigFiles::force_single_dex() const {
 
 bool ConfigFiles::disable_violation_fixes() const {
   return m_json.get("disable_violation_fixes", false);
+}
+
+bool ConfigFiles::preserve_count_integrity() const {
+  return m_json.get("preserve_count_integrity", false);
 }
 
 bool ConfigFiles::emit_incoming_hashes() const {

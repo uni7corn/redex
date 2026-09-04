@@ -22,7 +22,6 @@ $ ./native/redex/tools/redex-tool/DexSqlQuery.py dex.db
 */
 
 #include <boost/algorithm/string/replace.hpp>
-#include <queue>
 #include <unordered_map>
 #include <vector>
 

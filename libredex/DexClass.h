@@ -689,6 +689,12 @@ class DexDebugItem {
   uint32_t get_source_offset() const { return m_source_offset; }
   void bind_positions(DexMethod* method, const DexString* file);
 
+  // Upper bound on the bytes `encode` writes. Computable before the write,
+  // which is what lets DexOutput check that the item fits.
+  static size_t max_encoded_size(
+      uint32_t num_params,
+      const std::vector<std::unique_ptr<DexDebugInstruction>>& dbgops);
+
   /* Returns number of bytes encoded, *output has no alignment requirements */
   static int encode(
       DexOutputIdx* dodx,
@@ -817,6 +823,12 @@ class DexCode {
    * that must be done later.
    */
   int encode(DexOutputIdx* dodx, uint32_t* output);
+
+  // Upper bound on the bytes `encode` writes. Note this is NOT `size()`, which
+  // filters fopcodes and so under-counts every switch and array-data payload;
+  // `encode` emits them. Computable before the write, which is what lets
+  // DexOutput check that the item fits.
+  size_t max_encoded_size() const;
 
   /*
    * Returns the number of 2-byte code units needed to encode all the
@@ -1382,6 +1394,11 @@ class DexClass {
   /* Encodes class_data_item, returns size in bytes.  No
    * alignment requirements on *output
    */
+  // Upper bound on the bytes `encode` writes: four uleb128 counts, then per
+  // field an index delta and access flags, and per method those plus a code
+  // offset.
+  size_t max_encoded_size() const;
+
   int encode(DexOutputIdx* dodx, dexcode_to_offset& dco, uint8_t* output);
 
   template <typename C>

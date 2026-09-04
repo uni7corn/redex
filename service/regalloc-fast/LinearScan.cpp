@@ -7,12 +7,12 @@
 
 #include "LinearScan.h"
 
-#include <algorithm>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "IRList.h"

@@ -9,11 +9,11 @@
 #include "ConfigFiles.h"
 
 #include "Creators.h"
+#include "Debug.h"
 #include "DexAsm.h"
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "IRCode.h"
-#include "IRTypeChecker.h"
 #include "Show.h"
 #include "Walkers.h"
 

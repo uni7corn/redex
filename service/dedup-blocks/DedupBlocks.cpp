@@ -46,6 +46,7 @@
  */
 
 #include "DedupBlocks.h"
+#include "Debug.h"
 #include "DedupBlockValueNumbering.h"
 
 #include <algorithm>
@@ -90,6 +91,26 @@ static std::vector<cfg::Edge*> get_branch_or_goto_succs(
   return succs;
 }
 
+// Describe a successor target independently of which block we reached it from:
+// a self-edge becomes a sentinel, anything else stays the target itself.
+//
+// Must be canonical, not a pairwise "...or both point at themselves" test.
+// `collect_duplicates` uses successor equality as the key equality of a hash
+// map, so it must be a true equivalence relation. The pairwise form is not
+// transitive: with three identical-code blocks where A and B self-loop and C
+// branches to A, A~B holds (both self-loop) and A~C holds (targets are both A),
+// but B~C does not. Under a non-transitive equality, which group a block joins
+// depends on the order the map compares it against representatives -- not part
+// of the container's contract, and it shifts with the hash function.
+//
+// Two self-looping blocks still match. Mixed self-loop/branch-to-it pairs do
+// not, so equivalence classes can only shrink: this never admits a merge that
+// stricter matching would reject.
+static const cfg::Block* canonical_succ_target(const cfg::Block* owner,
+                                               const cfg::Block* target) {
+  return target == owner ? nullptr : target;
+}
+
 // The blocks must also have the exact same branch and goto successors.
 static bool same_branch_and_goto_successors(const cfg::Block* b1,
                                             const cfg::Block* b2) {
@@ -116,12 +137,8 @@ static bool same_branch_and_goto_successors(const cfg::Block* b1,
           b1_succ->case_key().value_or(0) != b2_succ->case_key().value_or(0)) {
         return false;
       }
-      auto* b1_succ_target = b1_succ->target();
-      auto* b2_succ_target = b2_succ->target();
-      // Either targets need to be the same, or both targets must be pointing
-      // to same block (to support deduping of simple self-loops).
-      if (b1_succ_target != b2_succ_target &&
-          (b1_succ_target != b1 || b2_succ_target != b2)) {
+      if (canonical_succ_target(b1, b1_succ->target()) !=
+          canonical_succ_target(b2, b2_succ->target())) {
         return false;
       }
     }
@@ -129,11 +146,11 @@ static bool same_branch_and_goto_successors(const cfg::Block* b1,
   }
 
   using Key = std::pair<cfg::EdgeType, cfg::Edge::CaseKey>;
-  UnorderedMap<Key, cfg::Block*, boost::hash<Key>> b2_succs_map;
+  UnorderedMap<Key, const cfg::Block*, boost::hash<Key>> b2_succs_map;
   for (auto* b2_succ : b2_succs) {
     b2_succs_map.emplace(
         std::make_pair(b2_succ->type(), b2_succ->case_key().value_or(0)),
-        b2_succ->target());
+        canonical_succ_target(b2, b2_succ->target()));
   }
   for (auto* b1_succ : b1_succs) {
     // For successors being the same, we need to find a matching entry for
@@ -143,11 +160,7 @@ static bool same_branch_and_goto_successors(const cfg::Block* b1,
     if (it == b2_succs_map.end()) {
       return false;
     }
-    auto* b2_succ_target = it->second;
-    // Either targets need to be the same, or both targets must be pointing to
-    // same block (to support deduping of simple self-loops).
-    if (b1_succ->target() != b2_succ_target &&
-        (b1_succ->target() != b1 || b2_succ_target != b2)) {
+    if (canonical_succ_target(b1, b1_succ->target()) != it->second) {
       return false;
     }
   }
@@ -207,8 +220,11 @@ struct BlockSuccHasher {
 
 struct MIEHasher {
   hash_t operator()(MethodItemEntry* mie) const {
-    return mie->type == MFLOW_OPCODE ? mie->insn->hash()
-                                     : mie->src_block->hash_ids();
+    if (mie->type == MFLOW_OPCODE) {
+      return mie->insn->hash();
+    }
+    always_assert(mie->type == MFLOW_SOURCE_BLOCK);
+    return mie->src_block->hash_ids();
   }
 };
 struct MIEEquals {
@@ -263,18 +279,100 @@ bool needs_pos(const IRList::iterator& begin, const IRList::iterator& end) {
 
 namespace dedup_blocks_impl {
 
+// Returns the deobfuscated class descriptor for a method ref, surviving
+// RenameClassesPass (which mutates DexType names in place). Falls back to the
+// current type name when no deobfuscated name is available (e.g. before rename
+// passes run, or for types that were not renamed).
+static std::string_view get_deobfuscated_class_name(const DexMethodRef* m) {
+  auto* cls_def = type_class(m->get_class());
+  if (cls_def != nullptr) {
+    auto deob = cls_def->get_deobfuscated_name_or_empty();
+    if (!deob.empty()) {
+      return deob;
+    }
+  }
+  return m->get_class()->str();
+}
+
+// Returns true if this invoke-static targets a helper method whose body
+// is "throw new SomeThrowable(...)". Collapsing multiple callsites of such
+// helpers mis-attributes runtime exceptions -- the callsite PC is what
+// symbolicates in the stack trace.
+//
+// Uses deobfuscated names so the check survives RenameClassesPass (which
+// makes DexType::get_type("Lkotlin/...") return nullptr) and ObfuscatePass
+// (which renames method names, e.g. "throwFoo" -> "A0O").
+//
+// Known producers:
+//   - kotlin.jvm.internal.Intrinsics.throw* -- Kotlin compiler (!!,
+//     lateinit, contract, parameter null-checks).
+//   - com.redex.UnreachableException.createAndThrow -- Redex synthetic.
+static bool check_throw_helper_names(std::string_view cls_name,
+                                     std::string_view method_name) {
+  if (cls_name == "Lkotlin/jvm/internal/Intrinsics;" &&
+      method_name.starts_with("throw")) {
+    return true;
+  }
+  if (cls_name == "Lcom/redex/UnreachableException;" &&
+      method_name == "createAndThrow") {
+    return true;
+  }
+  return false;
+}
+
+static bool is_throw_delegating_helper(const DexMethodRef* m) {
+  // Try the def's fully-deobfuscated name first (works after both
+  // RenameClassesPass + ObfuscatePass; set on method defs including
+  // external methods loaded from JARs like kotlin-stdlib).
+  const DexMethod* def = m->is_def() ? m->as_def() : nullptr;
+  if (def == nullptr) {
+    def = resolve_method_deprecated(const_cast<DexMethodRef*>(m),
+                                    MethodSearch::Static);
+  }
+  if (def != nullptr) {
+    auto deob = def->get_deobfuscated_name_or_empty();
+    if (!deob.empty()) {
+      if (deob.find("Lkotlin/jvm/internal/Intrinsics;.throw") !=
+          std::string_view::npos) {
+        return true;
+      }
+      if (deob.find("Lcom/redex/UnreachableException;.createAndThrow:") !=
+          std::string_view::npos) {
+        return true;
+      }
+      return false;
+    }
+    // Def exists but has no deobfuscated name (pre-rename). Use the def's
+    // simple deobfuscated name for the method part.
+    auto simple = def->get_simple_deobfuscated_name();
+    if (!simple.empty()) {
+      return check_throw_helper_names(get_deobfuscated_class_name(m), simple);
+    }
+  }
+  // Final fallback: deobfuscated class name + current method name.
+  // Only correct before ObfuscatePass renames method names.
+  auto cls_name = get_deobfuscated_class_name(m);
+  const auto* name = m->get_name();
+  if (name == nullptr) {
+    return false;
+  }
+  return check_throw_helper_names(cls_name, name->str());
+}
+
 bool is_ineligible_because_of_fill_in_stack_trace(const IRInstruction* insn) {
   auto op = insn->opcode();
   DexMethod* resolved_method{nullptr};
   // Direct call to a constructor whose class derives from Throwable?
   // (It would indirectly call java.lang.Throwable.fillInStackTrace.)
+  // These pointer comparisons are rename-safe: type::java_lang_Throwable()
+  // returns the stable DexType* whose identity persists through rename.
   if (opcode::is_invoke_direct(op) && method::is_init(insn->get_method()) &&
       type::is_subclass(type::java_lang_Throwable(),
                         insn->get_method()->get_class())) {
     return true;
   }
-  // Explicit virtual call to the java.lang.Throwable.fillInStackTrace
-  // method?
+  // Explicit virtual call to Throwable.fillInStackTrace?
+  // (Pointer comparison -- rename-safe.)
   if (opcode::is_invoke_virtual(op)) {
     resolved_method =
         resolve_method_deprecated(insn->get_method(), MethodSearch::Virtual);
@@ -283,13 +381,16 @@ bool is_ineligible_because_of_fill_in_stack_trace(const IRInstruction* insn) {
     }
   }
   // An outlined method might invoke one of the above, so we are being
-  // conservative here.
+  // conservative here. Also catch static throw-delegating helpers
+  // (Kotlin Intrinsics.throw*, Redex UnreachableException.createAndThrow)
+  // whose body throws but whose callsite PC is what symbolicates.
   if (opcode::is_invoke_static(op) &&
-      outliner::is_outlined_method(insn->get_method())) {
+      (outliner::is_outlined_method(insn->get_method()) ||
+       is_throw_delegating_helper(insn->get_method()))) {
     return true;
   }
   // We should not collapse the callsites of methods marked as dont-inline to
-  // preserve their stack traces more accurately
+  // preserve their stack traces more accurately.
   if (opcode::is_an_invoke(op)) {
     if (resolved_method == nullptr) {
       if (opcode::is_invoke_super(op)) {
@@ -441,9 +542,14 @@ class DedupBlocksImpl {
     return duplicates;
   }
 
-  static size_t remove_instructions(SourceBlock* src_block,
+  // `src_block` is a reference because the caller has already filtered out
+  // canon blocks without one; passing it as a raw pointer forced the
+  // nullability analysis to re-prove that across the call boundary, which it
+  // cannot do.
+  static size_t remove_instructions(SourceBlock& src_block,
                                     cfg::Block* block,
                                     const cfg::ControlFlowGraph& cfg) {
+    always_assert(block != nullptr);
     size_t cnt{0};
 
     auto it = block->begin();
@@ -459,7 +565,16 @@ class DedupBlocksImpl {
       } break;
 
       case MFLOW_SOURCE_BLOCK: {
-        src_block->max(*cur_it->src_block);
+        // This block is a duplicate being folded into the survivor `src_block`;
+        // both ran independently, so their counts accumulate (appear100 maxes).
+        src_block.add(*cur_it->src_block);
+        block->remove_mie(cur_it);
+        ++cnt;
+      } break;
+
+      // Remarks are block-anchored metadata with no merge op; drop the
+      // duplicate block's remarks (never blocks a legitimate merge).
+      case MFLOW_REMARK: {
         block->remove_mie(cur_it);
         ++cnt;
       } break;
@@ -534,7 +649,7 @@ class DedupBlocksImpl {
 
           // Undercounts branch instructions.
           m_stats.insns_removed +=
-              static_cast<int>(remove_instructions(src_block, block, cfg));
+              static_cast<int>(remove_instructions(*src_block, block, cfg));
 
           cfg.add_edge(block, canon, cfg::EDGE_GOTO);
 
@@ -553,29 +668,46 @@ class DedupBlocksImpl {
         auto num_canon_sb = canon_source_blocks.size();
 
         for (cfg::Block* block : group) {
-          if (block != canon) {
-            always_assert(canon->id() < block->id());
-
-            blocks_to_replace.emplace_back(block, canon);
-            ++cnt;
+          // canon's own counts are already the starting values in
+          // `canon_source_blocks`; skip it so we don't add it to itself (the
+          // old `max` was idempotent on canon, but `add` is not). This mirrors
+          // the instrument path, which also skips canon.
+          if (block == canon) {
+            continue;
           }
+          always_assert(canon->id() < block->id());
+
+          blocks_to_replace.emplace_back(block, canon);
+          ++cnt;
+
+          // Each duplicate block ran independently; folding it into canon means
+          // canon is now reached by the union of predecessors, so the counts
+          // accumulate (SUM). `add` also maxes `appear100` (a probability,
+          // never summed).
           std::vector<SourceBlock*> source_blocks =
               source_blocks::gather_source_blocks(block);
           auto num_sb = source_blocks.size();
           if (num_sb == num_canon_sb) {
             for (size_t source_blk_idx = 0; source_blk_idx < num_sb;
                  source_blk_idx++) {
-              canon_source_blocks[source_blk_idx]->max(
+              canon_source_blocks[source_blk_idx]->add(
                   *source_blocks[source_blk_idx]);
             }
           } else if (num_sb >= 1 && num_canon_sb >= 1) {
-            source_blocks::get_first_source_block(canon)->max(
+            // Rare defensive fallback for a structural mismatch: identical
+            // blocks normally carry the same NUMBER of source blocks (identical
+            // instruction sequences get identical SB structure), so the paired
+            // branch above is the norm. Here the two counts differ, so we can't
+            // pair 1:1 -- add the duplicate's first SB to canon's first, then
+            // broadcast its last SB across canon's remaining tail (approximate,
+            // inherited from the prior `max` code).
+            source_blocks::get_first_source_block(canon)->add(
                 *source_blocks::get_first_source_block(block));
             auto last_source_block =
                 *source_blocks::get_last_source_block(block);
             for (size_t source_blk_idx = 1; source_blk_idx < num_canon_sb;
                  source_blk_idx++) {
-              canon_source_blocks[source_blk_idx]->max(last_source_block);
+              canon_source_blocks[source_blk_idx]->add(last_source_block);
             }
           }
         }
@@ -845,20 +977,32 @@ class DedupBlocksImpl {
     return splitGroupMap;
   }
 
+  // The first entry that is not a redex-internal remark. Remarks are stripped
+  // before dex emission and must stay transparent to dedup, so a remark at a
+  // block's head must not hide the source block (or move-result) behind it.
+  IRList::iterator first_non_remark(cfg::Block* b) {
+    auto it = b->begin();
+    while (it != b->end() && it->type == MFLOW_REMARK) {
+      ++it;
+    }
+    return it;
+  }
+
   // copy over the last source block of the main block to the commmon block
   void copy_last_source_block(cfg::Block* block, cfg::Block* split_block) {
     SourceBlock* last_src_blk = source_blocks::get_last_source_block(block);
-    if (last_src_blk != nullptr) {
-      auto new_sb = std::make_unique<SourceBlock>(*last_src_blk);
-      new_sb->id = SourceBlock::kSyntheticId;
-      new_sb->next = nullptr;
-      auto split_block_it = split_block->begin();
-      if (split_block_it != split_block->end() &&
-          opcode::is_move_result_any(split_block_it->insn->opcode())) {
-        split_block->insert_after(split_block_it, std::move(new_sb));
-      } else {
-        split_block->insert_before(split_block_it, std::move(new_sb));
-      }
+    if (last_src_blk == nullptr) {
+      return;
+    }
+    auto new_sb = std::make_unique<SourceBlock>(*last_src_blk);
+    new_sb->id = SourceBlock::kSyntheticId;
+    new_sb->next = nullptr;
+    auto it = first_non_remark(split_block);
+    if (it != split_block->end() && it->type == MFLOW_OPCODE &&
+        opcode::is_move_result_any(it->insn->opcode())) {
+      split_block->insert_after(it, std::move(new_sb));
+    } else {
+      split_block->insert_before(it, std::move(new_sb));
     }
   }
 
@@ -879,6 +1023,22 @@ class DedupBlocksImpl {
     auto original_copy = std::make_unique<SourceBlock>(*sb);
     source_blocks::impl::BlockAccessor::insert_source_block_after(
         block, last_insn_it, std::move(original_copy));
+    // The split block's copy becomes a synthetic marker.
+    sb->id = SourceBlock::kSyntheticId;
+    sb->next = nullptr;
+  }
+
+  // After a postfix split, keep a source block in both halves for coverage.
+  // A leading remark is transparent, so skip it when checking whether the
+  // split block already begins with a source block.
+  void restore_source_blocks_after_split(cfg::Block* block,
+                                         cfg::Block* split_block) {
+    auto head = first_non_remark(split_block);
+    if (head == split_block->end() || head->type != MFLOW_SOURCE_BLOCK) {
+      copy_last_source_block(block, split_block);
+    } else {
+      copy_first_source_block(block, split_block);
+    }
   }
 
   // When instrumenting, do not deduplicate catch handler head blocks. If
@@ -952,13 +1112,7 @@ class DedupBlocksImpl {
             split_block = cfg.split_block(block, fwd_ir_it);
           }
           // add a source block in the beginning if there isn't one already
-          if (split_block->begin()->type != MFLOW_SOURCE_BLOCK) {
-            copy_last_source_block(block, split_block);
-          } else {
-            // The first entry moved was a source block — clone it back into
-            // the original block so both blocks retain coverage.
-            copy_first_source_block(block, split_block);
-          }
+          restore_source_blocks_after_split(block, split_block);
           continue;
         }
 
@@ -988,13 +1142,7 @@ class DedupBlocksImpl {
         // Split the block and add a source block in the beginning if there
         // isn't one already
         auto* split_block = cfg.split_block(cfg_it);
-        if (split_block->begin()->type != MFLOW_SOURCE_BLOCK) {
-          copy_last_source_block(block, split_block);
-        } else {
-          // The first entry moved was a source block — clone it back into
-          // the original block so both blocks retain coverage.
-          copy_first_source_block(block, split_block);
-        }
+        restore_source_blocks_after_split(block, split_block);
 
         TRACE(DEDUP_BLOCKS, 4,
               "split_postfix: split block : old = %zu, new = %zu", block->id(),

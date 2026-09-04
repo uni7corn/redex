@@ -9,6 +9,7 @@
 
 #include "ConcurrentContainers.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexLimits.h"
 #include "DexStore.h"
 #include "DexUtil.h"
@@ -60,12 +61,11 @@ class DexState {
   }
 
   bool can_insert_type_refs(const UnorderedSet<const DexType*>& types) {
-    size_t inserted_count{0};
-    for (const auto* t : UnorderedIterable(types)) {
-      if (m_type_refs.count(t) == 0u) {
-        inserted_count++;
-      }
-    }
+    // `unordered_count_if` returns a signed difference_type; the sum below is
+    // compared against an unsigned size, so narrow it here rather than let the
+    // comparison do it.
+    auto inserted_count = static_cast<size_t>(unordered_count_if(
+        types, [this](const auto* t) { return !m_type_refs.contains(t); }));
     // Yes, looks a bit quirky, but matching what happens in
     // InterDex/DexStructure: The number of type refs must stay *below* the
     // maximum, and must never reach it.
@@ -128,6 +128,7 @@ const DexString* get_split_method_name(
 }
 
 ConcurrentSet<DexMethod*> split_splittable_closures(
+    const Config& config,
     const std::vector<DexClasses*>& dexen,
     int32_t min_sdk,
     const init_classes::InitClassesWithSideEffects&
@@ -245,7 +246,13 @@ ConcurrentSet<DexMethod*> split_splittable_closures(
         }
         if ((concurrent_hot_methods != nullptr) &&
             (concurrent_hot_methods->count(method) != 0u)) {
-          concurrent_hot_methods->insert(method);
+          // The split inherits the root's profile stats via
+          // `concurrent_new_hot_split_methods` above, so it is compiled too and
+          // must join the hot set for later iterations to see it as one.
+          // Re-inserting `method` (the historical behaviour, kept when the flag
+          // is off) is a no-op: the guard has already proven it present.
+          concurrent_hot_methods->insert(
+              config.fix_new_hot_split_registration ? new_method : method);
         }
         break;
       }
@@ -284,6 +291,18 @@ SplitMethod SplitMethod::create(const SplittableClosure& splittable_closure,
       std::make_unique<IRCode>(std::make_unique<cfg::ControlFlowGraph>());
   auto& split_cfg = split_code->cfg();
   split_code->set_debug_item(std::make_unique<DexDebugItem>());
+  // NOTE for callers building non-suffix splits (e.g. cold mid-method
+  // regions): `deep_copy` preserves ALL edges of the original cfg --
+  // including those crossing what the caller may consider a region
+  // boundary. The split body will continue to execute past that
+  // boundary unless the caller explicitly truncates it. For suffix
+  // splits the boundary IS the original method's return so no
+  // truncation is needed. For region splits, the caller must walk
+  // the region's exit edges in `split_cfg`, delete them, and append
+  // a `return-*` instruction -- otherwise the split body double-
+  // executes the rejoin code AND the launchpad's `goto rejoin`
+  // executes it again. See `apply_code_changes` below for the canonical
+  // truncation pattern.
   cfg.deep_copy(&split_cfg);
   auto* split_entry_block = split_cfg.create_block();
   for (const auto& arg : splittable_closure.args) {
@@ -335,11 +354,11 @@ SplitMethod SplitMethod::create(const SplittableClosure& splittable_closure,
       split_target_ids.insert(closure->target->id());
     }
     split_cfg.delete_succ_edge_if(split_landingpad, [&](auto* e) {
-      return !split_target_ids.count(e->target()->id());
+      return !split_target_ids.contains(e->target()->id());
     });
     cfg.delete_succ_edge_if(splittable_closure.switch_block, [&](auto* e) {
       return e->type() == cfg::EDGE_BRANCH &&
-             split_target_ids.count(e->target()->id());
+             split_target_ids.contains(e->target()->id());
     });
   }
   split_cfg.add_edge(split_entry_block, split_landingpad, cfg::EDGE_GOTO);
@@ -452,6 +471,7 @@ void split_methods_in_stores(
     DexStoresVector& stores,
     int32_t min_sdk,
     const Config& config,
+    const StoreRefCheckers& store_ref_checkers,
     bool create_init_class_insns,
     size_t reserved_mrefs,
     size_t reserved_trefs,
@@ -533,15 +553,24 @@ void split_methods_in_stores(
     TRACE(MS, 2, "=== iteration[%zu]", iteration);
     Timer t("iteration " + std::to_string(iteration++));
     auto splittable_closures = select_splittable_closures_based_on_costs(
-        methods, config, concurrent_hot_methods,
-        concurrent_splittable_no_optimizations_methods);
+        methods, config, store_ref_checkers, concurrent_hot_methods,
+        concurrent_splittable_no_optimizations_methods,
+        &stats->arg_type_illegal);
     ConcurrentSet<DexMethod*> concurrent_added_methods;
     methods = split_splittable_closures(
-        dexen, min_sdk, init_classes_with_side_effects, reserved_trefs,
+        config, dexen, min_sdk, init_classes_with_side_effects, reserved_trefs,
         reserved_mrefs, splittable_closures, name_infix, &uniquifiers, stats,
         &dex_states, &concurrent_added_methods, concurrent_hot_methods,
         concurrent_new_hot_split_methods);
-    insert_unordered_iterable(stats->added_methods, concurrent_added_methods);
+    // Transfer per-iteration newly-emitted splits into Stats. Sort by
+    // method identity so the append order is deterministic across
+    // runs (ConcurrentSet iteration is not).
+    auto sorted =
+        unordered_to_ordered(concurrent_added_methods, compare_dexmethods);
+    stats->added_methods.reserve(stats->added_methods.size() + sorted.size());
+    for (auto* m : sorted) {
+      stats->added_methods.emplace_back(m, SplitKind::Suffix);
+    }
     TRACE(MS, 1, "[%zu] Split out %zu methods", iteration,
           concurrent_added_methods.size());
   }

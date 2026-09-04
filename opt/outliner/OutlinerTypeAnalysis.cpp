@@ -7,7 +7,10 @@
 
 #include "OutlinerTypeAnalysis.h"
 
+#include "Debug.h"
+#include "DexClass.h"
 #include "DexTypeEnvironment.h"
+#include "Lazy.h"
 #include "Show.h"
 
 namespace outliner_impl {
@@ -53,9 +56,9 @@ OutlinerTypeAnalysis::OutlinerTypeAnalysis(DexMethod* method)
         auto& cfg = method->get_code()->cfg();
         type_inference::TypeInference type_inference(cfg);
         type_inference.run(method);
-        TypeEnvironments res;
-        insert_unordered_iterable(res, type_inference.get_type_environments());
-        return res;
+        // Move, not copy: `type_inference` is a local that dies with this
+        // lambda, and the map holds one environment per instruction.
+        return std::move(type_inference.get_type_environments());
       }),
       m_constant_uses([method]() {
         auto& cfg = method->get_code()->cfg();
@@ -170,12 +173,10 @@ const DexType* OutlinerTypeAnalysis::narrow_type_demands(
 static bool any_outside_range(const UnorderedSet<const IRInstruction*>& insns,
                               int64_t min,
                               int64_t max) {
-  for (const auto* insn : UnorderedIterable(insns)) {
-    if (insn->get_literal() < min || insn->get_literal() > max) {
-      return true;
-    }
-  }
-  return false;
+  return unordered_any_of(insns, [min, max](const IRInstruction* insn) {
+    const auto literal = insn->get_literal();
+    return literal < min || literal > max;
+  });
 }
 
 template <class T>
@@ -816,6 +817,10 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
     const CandidateAdapter* ca,
     const UnorderedSet<const IRInstruction*>& const_insns) {
   always_assert(!const_insns.empty());
+  // `get_type_of_defs` classifies `IOPCODE_UNREACHABLE` (a synthetic undefined
+  // value) separately and never routes it here: it carries no literal, so both
+  // the constant-uses analysis and the literal-range checks below would assert
+  // on it. Only real `const`/`const-wide` defs reach this point.
   // 1. Let's see if we can get something out of the constant-uses analysis.
   constant_uses::TypeDemand type_demand{constant_uses::TypeDemand::None};
   for (const auto* insn : UnorderedIterable(const_insns)) {
@@ -858,6 +863,14 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
   // 2. Let's go over all constant-uses, and use our own judgement.
   UnorderedSet<const DexType*> type_demands;
   bool not_object{false};
+  // Both scan all of `const_insns`, which does not change in the loop below, so
+  // each is worth computing at most once. Lazily, because most opcodes reach
+  // neither: an eager pair of scans would charge every caller for work the
+  // switch below usually never asks for.
+  Lazy<bool> any_outside_bit(
+      [&const_insns] { return any_outside_range(const_insns, 0, 1); });
+  Lazy<bool> any_outside_zero(
+      [&const_insns] { return any_outside_range(const_insns, 0, 0); });
   for (const auto* insn : UnorderedIterable(const_insns)) {
     for (const auto& p :
          m_constant_uses->get_constant_uses(const_cast<IRInstruction*>(insn))) {
@@ -871,7 +884,7 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
       case OPCODE_AND_INT_LIT:
       case OPCODE_OR_INT_LIT:
       case OPCODE_XOR_INT_LIT:
-        if (any_outside_range(const_insns, 0, 1)) {
+        if (*any_outside_bit) {
           type_demands.insert(type::_int());
         } else {
           type_demands.insert(type::_boolean());
@@ -894,7 +907,7 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
       case OPCODE_IF_GTZ:
       case OPCODE_IF_LEZ:
         // Could be int or object
-        if (any_outside_range(const_insns, 0, 0)) {
+        if (*any_outside_zero) {
           type_demands.insert(type::_int());
           break;
         }
@@ -921,7 +934,13 @@ const DexType* OutlinerTypeAnalysis::get_const_insns_type_demand(
 static const DexType* compute_joined_type(
     const UnorderedSet<const DexType*>& types) {
   std::optional<dtv_impl::DexTypeValue> joined_type_value;
-  for (const auto* t : UnorderedIterable(types)) {
+  // `join_with` is neither associative nor commutative. When the common super
+  // class walk reaches Object, `find_common_type` resolves through the
+  // interfaces the operands share: sharing several incomparable ones is an
+  // intersection type no DexType can hold, so it gives up to Top, and the
+  // shared set is collected from the left operand only. Either one makes the
+  // fold depend on the visit order. Fold in a stable type order.
+  for (const auto* t : unordered_to_ordered(types, compare_dextypes)) {
     if (!type::is_object(t)) {
       return nullptr;
     }
@@ -949,6 +968,7 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
     types.insert(optional_extra_type);
   }
   UnorderedSet<const IRInstruction*> const_insns;
+  bool any_unreachable = false;
   for (const auto* def : UnorderedIterable(defs)) {
     always_assert(!opcode::is_a_move(def->opcode()) &&
                   !opcode::is_move_result_any(def->opcode()));
@@ -983,9 +1003,17 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
           }
         }
         return false;
+      case IOPCODE_UNREACHABLE:
+        // A synthetic undefined value carries no literal and no type demand.
+        // Keep it out of `const_insns`: the constant-uses analysis and the
+        // literal-range checks (`any_outside*`) below both call
+        // `get_literal()`, which asserts on it. Its only effect is that, if
+        // nothing else contributes a type, the result is undeterminable
+        // (handled below where `types` is empty).
+        any_unreachable = true;
+        return false;
       case OPCODE_CONST:
       case OPCODE_CONST_WIDE:
-      case IOPCODE_UNREACHABLE:
         const_insns.insert(def);
         return false;
       default:
@@ -1009,7 +1037,12 @@ const DexType* OutlinerTypeAnalysis::get_type_of_defs(
   }
 
   if (types.empty()) {
-    always_assert(!const_insns.empty());
+    if (const_insns.empty()) {
+      // Only undefined (unreachable) defs contributed; with no real const or
+      // typed producer, the type is undeterminable.
+      always_assert(any_unreachable);
+      return nullptr;
+    }
     return get_const_insns_type_demand(ca, const_insns);
   }
 

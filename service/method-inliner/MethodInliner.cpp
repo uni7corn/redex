@@ -8,8 +8,6 @@
 #include "MethodInliner.h"
 
 #include <algorithm>
-#include <map>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -18,6 +16,7 @@
 #include "ClassUtil.h"
 #include "ConfigFiles.h"
 #include "ConstructorAnalysis.h"
+#include "Debug.h"
 #include "Deleter.h"
 #include "DexClass.h"
 #include "DexUtil.h"
@@ -490,13 +489,18 @@ void gather_true_virtual_methods(
       return hash;
     }
   };
+  // The value is an (unordered) bag of overriding methods; two threads racing
+  // to create the same key may build it in a different element order, so the
+  // concurrency sanity-check compares the bags as sets (interned DexMethod
+  // pointers => pointer identity), not as ordered sequences.
   InsertOnlyConcurrentMap<Key, UnorderedBag<const DexMethod*>, Hash>
       concurrent_overriding_methods;
   auto get_overriding_methods =
       [&](DexMethod* callee,
           DexType* static_base_type) -> const UnorderedBag<const DexMethod*>& {
     return *concurrent_overriding_methods
-                .get_or_create_and_assert_equal(
+                .get_or_create_and_assert_equal<
+                    UnorderedEqual<UnorderedBag<const DexMethod*>>>(
                     Key{callee, static_base_type},
                     [&](const Key&) {
                       auto overriding_methods = mog::get_overriding_methods(
@@ -919,7 +923,7 @@ void run_inliner(
   InsertOnlyConcurrentSet<DexMethod*> methods_with_write_barrier;
   UnorderedSet<const DexMethod*> unfinalized_init_methods;
   if (inliner_config.relaxed_init_inline &&
-      inliner_config.unfinalize_relaxed_init_inline && min_sdk >= 21) {
+      inliner_config.unfinalize_relaxed_init_inline) {
     unfinalize_fields_if_beneficial_for_relaxed_init_inlining(
         scope, inliner_config.unfinalize_perf_mode, &unfinalized_fields,
         &methods_with_write_barrier);

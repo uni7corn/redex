@@ -8,17 +8,20 @@
 #include "InstructionSequenceOutliner.h"
 
 #include <gtest/gtest.h>
-#include <iterator>
 #include <utility>
 
+#include "BigBlocks.h"
+#include "DeterministicContainers.h"
 #include "DexAsm.h"
 #include "DexClass.h"
 #include "DexStore.h"
 #include "IRAssembler.h"
 #include "IRCode.h"
+#include "OutliningProfileGuidanceImpl.h"
 #include "PassManager.h"
 #include "RedexTest.h"
 #include "ScopeHelper.h"
+#include "SourceBlocks.h"
 #include "TypeUtil.h"
 
 namespace {
@@ -196,4 +199,45 @@ TEST_F(InstructionSequenceOutlinerTest, iputsBeforeBaseInitInvocation) {
     }
   }
   EXPECT_CODE_EQ(expected_init_code.get(), outlined_init_code);
+}
+
+// Regression for the inverted null-check in throughput detection
+// (OutliningProfileGuidanceImpl `if (!val_pair && val_pair->val > ...)`): a
+// warm, non-loop big block that carries a throughput-interaction source block
+// whose val exceeds `block_profiles_hits` must NOT be freely outlinable. With
+// the inverted check the block was never recognized as throughput, so the
+// decider wrongly returned CanOutline.
+TEST_F(InstructionSequenceOutlinerTest,
+       ThroughputSourceBlockSuppressesOutline) {
+  using namespace outliner_impl;
+
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (.src_block "LC;.bar:()V" 0 (1.0 1.0))
+      (return-void)
+    ))");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  auto* entry = cfg.entry_block();
+  ASSERT_NE(nullptr, source_blocks::get_first_source_block(entry));
+
+  outliner::ProfileGuidanceConfig config;
+  // >= 0 so we reach the magnitude comparison rather than the block_profiles<0
+  // shortcut; the SB val (1.0) sits above it.
+  config.block_profiles_hits = 0.0f;
+  UnorderedSet<size_t> throughput_indices;
+  throughput_indices.insert(0);
+
+  auto* method = DexMethod::make_method("LC;.bar:()V")
+                     ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+  UnorderedSet<DexMethod*> throughput_methods;
+  UnorderedSet<DexMethod*> warm_methods{method};
+  UnorderedSet<DexMethod*> hot_methods;
+
+  const OutlineabilityContext outlineability(config, throughput_indices,
+                                             throughput_methods, warm_methods,
+                                             hot_methods);
+  big_blocks::BigBlock big_block({entry});
+  EXPECT_EQ(outlineability.can_outline_from_big_block(method, big_block),
+            OutlineabilityContext::Result::WarmLoopExceedsThresholds);
 }

@@ -184,6 +184,127 @@ TEST_F(ConstantPropagationTest, NullCheckCastYieldsNull) {
   EXPECT_CODE_EQ(code.get(), expected_code.get());
 }
 
+// A non-null value (from new-instance, which is NEZ) retains its non-nullness
+// through a check-cast, so the following null check folds to the non-null path.
+TEST_F(ConstantPropagationTest, NonNullSurvivesCheckCast) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (new-instance "LFoo;")
+     (move-result-pseudo-object v0)
+     (check-cast v0 "LFoo;")
+     (move-result-pseudo-object v1)
+     (if-eqz v1 :next)
+     (const v2 1)
+     (goto :end)
+     (:next)
+     (const v2 2)
+     (:end)
+     (return v2)
+    )
+  )");
+
+  do_const_prop(code.get());
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (check-cast v0 "LFoo;")
+      (move-result-pseudo-object v1)
+      (const v2 1)
+      (return v2)
+    )
+  )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+// A check-cast applied to a known object constant (e.g. from const-string or
+// const-class) is kept, not deleted -- removing a cast that can throw at
+// runtime would change behavior.
+TEST_F(ConstantPropagationTest, CheckCastPreservedWhenOperandIsConstant) {
+  const auto* code_str = R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (check-cast v0 "LBar;")
+     (move-result-pseudo-object v1)
+     (return-object v1)
+    )
+  )";
+  auto code = assembler::ircode_from_string(code_str);
+
+  auto state = cp::StringAnalyzerState::make_default();
+  do_const_prop(
+      code.get(),
+      InstructionAnalyzerCombiner<cp::StringAnalyzer, cp::PrimitiveAnalyzer>(
+          &state, nullptr));
+
+  auto expected_code = assembler::ircode_from_string(code_str);
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+// The exact string constant reaches the check-cast's result register in the
+// abstract state, not merely non-nullness.
+TEST_F(ConstantPropagationTest, CheckCastResultRetainsExactConstant) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (check-cast v0 "LBar;")
+     (move-result-pseudo-object v1)
+     (return-object v1)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg.calculate_exit_block();
+  cp::NullCheckMethods null_check_methods;
+  auto state = cp::StringAnalyzerState::make_default();
+  cp::intraprocedural::FixpointIterator intra_cp(
+      cfg,
+      InstructionAnalyzerCombiner<cp::StringAnalyzer, cp::PrimitiveAnalyzer>(
+          &state, nullptr),
+      cp::intraprocedural::make_default_no_throw_analyzer(&null_check_methods));
+  intra_cp.run(ConstantEnvironment());
+
+  auto exit_state = intra_cp.get_exit_state_at(cfg.exit_block());
+  auto v1 = exit_state.get(1u).maybe_get<StringDomain>();
+  ASSERT_TRUE(v1 && v1->get_constant());
+  EXPECT_EQ(*v1->get_constant(), DexString::make_string("foo"));
+}
+
+// A non-null object constant whose type is castable to the target passes the
+// check-cast, so the cast never throws and is deleted (its result
+// materialized).
+TEST_F(ConstantPropagationTest, CheckCastDeletedWhenProvablySucceeds) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (check-cast v0 "Ljava/lang/String;")
+     (move-result-pseudo-object v1)
+     (return-object v1)
+    )
+  )");
+
+  auto state = cp::StringAnalyzerState::make_default();
+  do_const_prop(
+      code.get(),
+      InstructionAnalyzerCombiner<cp::StringAnalyzer, cp::PrimitiveAnalyzer>(
+          &state, nullptr));
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (const-string "foo")
+     (move-result-pseudo-object v1)
+     (return-object v1)
+    )
+  )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
 TEST_F(ConstantPropagationTest, JumpToImmediateNext) {
   auto code = assembler::ircode_from_string(R"(
     (
@@ -242,6 +363,60 @@ TEST_F(ConstantPropagationTest, InstanceOfNull) {
       (return-void)
     )
   )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+TEST_F(ConstantPropagationTest, InstanceOfEvaluatedToTrueWhenEvaluableToTrue) {
+  // There is no evaluated-to-false counterpart test case when v0 is a nonnull
+  // constant: an object constant is only ever a java.lang.String or a
+  // java.lang.Class, and evaluate_type_check returns nullopt for external
+  // types, so instance-of on one never folds to 0.
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (instance-of v0 "Ljava/lang/String;")
+     (move-result-pseudo v1)
+     (return v1)
+    )
+  )");
+
+  auto state = cp::StringAnalyzerState::make_default();
+  do_const_prop(
+      code.get(),
+      InstructionAnalyzerCombiner<cp::StringAnalyzer, cp::PrimitiveAnalyzer>(
+          &state, nullptr));
+
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (const v1 1)
+     (return v1)
+    )
+  )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+TEST_F(ConstantPropagationTest, InstanceOfPreservedWhenRelationUndecidable) {
+  const auto* code_str = R"(
+    (
+     (const-string "foo")
+     (move-result-pseudo-object v0)
+     (instance-of v0 "LBar;")
+     (move-result-pseudo v1)
+     (return v1)
+    )
+  )";
+  auto code = assembler::ircode_from_string(code_str);
+
+  auto state = cp::StringAnalyzerState::make_default();
+  do_const_prop(
+      code.get(),
+      InstructionAnalyzerCombiner<cp::StringAnalyzer, cp::PrimitiveAnalyzer>(
+          &state, nullptr));
+
+  auto expected_code = assembler::ircode_from_string(code_str);
   EXPECT_CODE_EQ(code.get(), expected_code.get());
 }
 
@@ -897,9 +1072,10 @@ TEST_F(ConstantPropagationTest, WhiteBox1) {
   code->build_cfg();
   auto& cfg = code->cfg();
   cfg.calculate_exit_block();
-  cp::State cp_state;
+  cp::NullCheckMethods null_check_methods;
   cp::intraprocedural::FixpointIterator intra_cp(
-      &cp_state, cfg, cp::ConstantPrimitiveAnalyzer());
+      cfg, cp::ConstantPrimitiveAnalyzer(),
+      cp::intraprocedural::make_default_no_throw_analyzer(&null_check_methods));
   intra_cp.run(ConstantEnvironment());
 
   auto exit_state = intra_cp.get_exit_state_at(cfg.exit_block());
@@ -933,9 +1109,10 @@ TEST_F(ConstantPropagationTest, WhiteBox2) {
   code->build_cfg();
   auto& cfg = code->cfg();
   cfg.calculate_exit_block();
-  cp::State cp_state;
+  cp::NullCheckMethods null_check_methods;
   cp::intraprocedural::FixpointIterator intra_cp(
-      &cp_state, cfg, cp::ConstantPrimitiveAnalyzer());
+      cfg, cp::ConstantPrimitiveAnalyzer(),
+      cp::intraprocedural::make_default_no_throw_analyzer(&null_check_methods));
   intra_cp.run(ConstantEnvironment());
 
   auto exit_state = intra_cp.get_exit_state_at(cfg.exit_block());
@@ -1778,7 +1955,7 @@ TEST_F(ConstantPropagationTest,
 // PrimitiveAnalyzer, so the value is not a SignedConstantDomain(NEZ). The
 // transform must recognize object domains as non-null.
 TEST_F(ConstantPropagationTest, NewInstanceNullCheckElimination) {
-  // Create the Kotlin null check method so cp::State picks it up.
+  // Create the Kotlin null check method so cp::NullCheckMethods picks it up.
   auto* null_check = DexMethod::make_method(
       "Lkotlin/jvm/internal/Intrinsics;.checkParameterIsNotNull:"
       "(Ljava/lang/Object;Ljava/lang/String;)V");

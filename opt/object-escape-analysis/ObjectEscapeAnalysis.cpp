@@ -45,15 +45,15 @@
 
 #include <optional>
 
-#include "ApiLevelChecker.h"
 #include "CFGMutation.h"
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
+#include "DexClass.h"
 #include "ExpandableMethodParams.h"
 #include "GlobalConfig.h"
 #include "IRInstruction.h"
 #include "Inliner.h"
-#include "InlinerConfig.h"
 #include "LinearScan.h"
 #include "MutablePriorityQueue.h"
 #include "ObjectEscapeAnalysisImpl.h"
@@ -130,6 +130,22 @@ ConcurrentMap<const DexType*, InlineAnchorsOfType> compute_inline_anchors(
   return inline_anchors;
 }
 
+// Whether a `check-cast` to `cast_type`, applied to a tracked object of
+// `anchor_type`, is guaranteed to succeed.
+//
+// `get_augmented_du_chains` below needs this answer in two places, and they
+// MUST agree. One tracks a cast that can succeed as another def of the object;
+// the other treats a cast that cannot succeed as unconditionally throwing and
+// gives up on the whole reduced variant. Should they ever disagree, a cast can
+// be kept by one and untracked by the other: `stackify` rewrites the cast to
+// write a register it created, while the uses of the original destination were
+// never followed, so that destination is left read but never written. Ask the
+// question here, once, so the two cannot drift apart.
+bool check_cast_always_succeeds(const DexType* anchor_type,
+                                const DexType* cast_type) {
+  return type::is_subclass(cast_type, anchor_type);
+}
+
 live_range::DefUseChains get_augmented_du_chains(
     const method_override_graph::Graph& method_override_graph,
     DexMethod* method,
@@ -142,7 +158,7 @@ live_range::DefUseChains get_augmented_du_chains(
   auto is_inlinable_check_cast = [&](const auto* insn) {
     if (insn->opcode() == OPCODE_CHECK_CAST) {
       for (const auto* t : inline_anchor_types) {
-        if (type::is_subclass(insn->get_type(), t)) {
+        if (check_cast_always_succeeds(t, insn->get_type())) {
           return true;
         }
       }
@@ -185,7 +201,8 @@ live_range::DefUseChains get_augmented_du_chains(
       for (auto& use : UnorderedIterable(uses)) {
         if (opcode::is_check_cast(use.insn->opcode())) {
           if (throwing_check_cast &&
-              !type::is_subclass(use.insn->get_type(), inline_anchor_type)) {
+              !check_cast_always_succeeds(inline_anchor_type,
+                                          use.insn->get_type())) {
             *throwing_check_cast = true;
           }
           stack.push(use);
@@ -274,12 +291,6 @@ class InlinedEstimator {
   }
 
  public:
-  // Sentinel for the case where we encounter an unconditionally throwing cast.
-  // In this case, we'll abort and not consider this for inlining, as we don't
-  // want to bother modeling this rare case.
-  static constexpr const int64_t THROWING_CHECK_CAST =
-      std::numeric_limits<int64_t>::max();
-
   InlinedEstimator(const ObjectEscapeConfig& config,
                    const method_override_graph::Graph& method_override_graph,
                    const DexType* inline_anchor_type,
@@ -330,9 +341,6 @@ class InlinedEstimator {
                 m_method_summaries.at(callee).allocation_insn();
             always_assert(callee_allocation_insn);
             auto callee_delta = get_delta(callee, callee_allocation_insn);
-            if (callee_delta == THROWING_CHECK_CAST) {
-              return THROWING_CHECK_CAST;
-            }
             delta += 10 * (int64_t)m_inlined_code_sizes[callee] + callee_delta -
                      config.cost_invoke - config.cost_move_result;
           } else if (allocation_insn->opcode() == OPCODE_NEW_INSTANCE) {
@@ -359,9 +367,6 @@ class InlinedEstimator {
               always_assert(
                   opcode::is_load_param_object(load_param_insn->opcode()));
               auto callee_delta = get_delta(callee, load_param_insn);
-              if (callee_delta == THROWING_CHECK_CAST) {
-                return THROWING_CHECK_CAST;
-              }
               delta +=
                   10 * (int64_t)m_inlined_code_sizes[callee] + callee_delta;
               if (!callee->get_proto()->is_void()) {
@@ -462,7 +467,6 @@ UnorderedMap<DexMethod*, InlinableTypes> compute_root_methods(
   std::atomic<size_t> num_recursive{0};
   std::atomic<size_t> num_no_optimizations{0};
   std::atomic<size_t> num_returning{0};
-  std::atomic<size_t> num_throwing_check_casts{0};
 
   InsertOnlyConcurrentSet<DexMethod*> concurrent_inlinable_methods_kept;
   auto concurrent_add_root_methods = [&](const DexType* type, bool complete) {
@@ -510,18 +514,7 @@ UnorderedMap<DexMethod*, InlinableTypes> compute_root_methods(
         int64_t delta = 0;
         const auto& allocation_insns = inline_anchors_of_type.at(method);
         for (auto allocation_insn : UnorderedIterable(allocation_insns)) {
-          auto method_delta =
-              inlined_estimator.get_delta(method, allocation_insn);
-          if (method_delta == InlinedEstimator::THROWING_CHECK_CAST) {
-            delta = InlinedEstimator::THROWING_CHECK_CAST;
-            break;
-          }
-          delta += method_delta;
-        }
-        if (delta == InlinedEstimator::THROWING_CHECK_CAST) {
-          num_throwing_check_casts++;
-          keep(inlinable_methods);
-          return true;
+          delta += inlined_estimator.get_delta(method, allocation_insn);
         }
         if (delta > config.incomplete_estimated_delta_threshold) {
           // Skipping, as it's highly unlikely to result in an overall size
@@ -614,8 +607,11 @@ UnorderedMap<DexMethod*, InlinableTypes> compute_root_methods(
                             concurrent_inlinable_methods_kept);
   TRACE(OEA,
         1,
-        "[object escape analysis] candidate types: %zu",
-        candidate_types.size());
+        "[object escape analysis] candidate types: %zu complete-single-root, "
+        "%zu complete-multiple-roots, %zu incomplete",
+        candidate_types[(size_t)InlinableTypeKind::CompleteSingleRoot],
+        candidate_types[(size_t)InlinableTypeKind::CompleteMultipleRoots],
+        candidate_types[(size_t)InlinableTypeKind::Incomplete]);
   mgr.incr_metric(
       "candidate types CompleteSingleRoot",
       candidate_types[(size_t)InlinableTypeKind::CompleteSingleRoot]);
@@ -630,8 +626,6 @@ UnorderedMap<DexMethod*, InlinableTypes> compute_root_methods(
   mgr.incr_metric("root_methods_returning", (size_t)num_returning);
   mgr.incr_metric("root_methods_no_optimizations",
                   (size_t)num_no_optimizations);
-  mgr.incr_metric("root_methods_throwing_check_casts",
-                  (size_t)num_throwing_check_casts);
   return root_methods;
 }
 
@@ -1416,8 +1410,12 @@ class RootMethodReducer {
         mutation.remove(it);
       } else if (opcode::is_instance_of(opcode)) {
         auto move_result_it = cfg.move_result_of(it);
+        // The allocated object's runtime type is exactly the new-instance
+        // type, so the test reduces to whether that type is assignable to the
+        // tested type. This must consider implemented interfaces, not just the
+        // superclass chain.
         auto* new_insn =
-            (type::is_subclass(insn->get_type(), new_instance_insn->get_type())
+            (type::check_cast(new_instance_insn->get_type(), insn->get_type())
                  ? (new IRInstruction(OPCODE_MOVE))
                        ->set_src(0, get_created_reg(insn->src(0)))
                  : (new IRInstruction(OPCODE_CONST))->set_literal(0))

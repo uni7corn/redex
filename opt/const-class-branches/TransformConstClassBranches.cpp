@@ -14,8 +14,10 @@
 #include "ConstantEnvironment.h"
 #include "ConstantPropagationAnalysis.h"
 #include "Creators.h"
+#include "Debug.h"
 #include "DexClass.h"
 #include "DexStructure.h"
+#include "MethodUtil.h"
 #include "PassManager.h"
 #include "ScopedCFG.h"
 #include "Show.h"
@@ -188,7 +190,7 @@ void gather_possible_transformations(
 
   TRACE(CCB, 3, "Checking for const-class branching in %s", SHOW(method));
   auto fixpoint = std::make_shared<cp::intraprocedural::FixpointIterator>(
-      /* cp_state */ nullptr, cfg, SwitchEquivFinder::Analyzer());
+      cfg, SwitchEquivFinder::Analyzer());
   fixpoint->run(ConstantEnvironment());
 
   std::vector<cfg::Block*> blocks;
@@ -317,21 +319,19 @@ Stats apply_transform(const PassState& pass_state,
           (new IRInstruction(IOPCODE_MOVE_RESULT_PSEUDO_OBJECT))
               ->set_dest(extra_reg);
       instructions.push_back(move_result_pseudo);
-      auto* append = (new IRInstruction(OPCODE_INVOKE_VIRTUAL))
-                         ->set_srcs_size(2)
-                         ->set_src(0, sb_reg)
-                         ->set_src(1, extra_reg)
-                         ->set_method(DexMethod::get_method(
-                             "Ljava/lang/StringBuilder;.append:(Ljava/lang/"
-                             "String;)Ljava/lang/StringBuilder;"));
+      auto* append =
+          (new IRInstruction(OPCODE_INVOKE_VIRTUAL))
+              ->set_srcs_size(2)
+              ->set_src(0, sb_reg)
+              ->set_src(1, extra_reg)
+              ->set_method(method::java_lang_StringBuilder_append_String());
       instructions.push_back(append);
     }
     auto* to_string =
         (new IRInstruction(OPCODE_INVOKE_VIRTUAL))
             ->set_srcs_size(1)
             ->set_src(0, sb_reg)
-            ->set_method(DexMethod::get_method(
-                "Ljava/lang/StringBuilder;.toString:()Ljava/lang/String;"));
+            ->set_method(method::java_lang_StringBuilder_toString());
     instructions.push_back(to_string);
     auto* move_result =
         (new IRInstruction(OPCODE_MOVE_RESULT_OBJECT))->set_dest(sb_reg);

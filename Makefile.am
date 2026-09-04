@@ -117,6 +117,7 @@ libredex_la_SOURCES = \
 	libredex/BalancedPartitioning.cpp \
 	libredex/BaselineProfile.cpp \
 	libredex/BigBlocks.cpp \
+	libredex/BlockOffsetSink.cpp \
 	libredex/BundleResources.cpp \
 	libredex/CFGMutation.cpp \
 	libredex/CallGraph.cpp \
@@ -155,6 +156,7 @@ libredex_la_SOURCES = \
 	libredex/DexTypeEnvironment.cpp \
 	libredex/DexUtil.cpp \
 	libredex/DexStoreUtil.cpp \
+	libredex/DexVt.cpp \
 	libredex/DuplicateClasses.cpp \
 	libredex/FbjniMarker.cpp \
 	libredex/FrameworkApi.cpp \
@@ -232,6 +234,7 @@ libredex_la_SOURCES = \
 	libredex/Show.cpp \
 	libredex/SourceBlockConsistencyCheck.cpp \
 	libredex/SourceBlocks.cpp \
+	libredex/SourceBlocksViolations.cpp \
 	libredex/StringTreeSet.cpp \
 	libredex/Timer.cpp \
 	libredex/ThreadPool.cpp \
@@ -245,6 +248,7 @@ libredex_la_SOURCES = \
 	libredex/UniqueMethodTracker.cpp \
 	libredex/UnknownVirtuals.cpp \
 	libredex/VirtualScope.cpp \
+	libredex/VirtualScopes.cpp \
 	libredex/Warning.cpp \
 	libredex/WorkQueue.cpp \
 	service/api-levels/ApiLevelsUtils.cpp \
@@ -261,7 +265,6 @@ libredex_la_SOURCES = \
 	service/class-merging/ModelMethodMerger.cpp \
 	service/class-merging/Model.cpp \
 	service/class-merging/TypeTagUtils.cpp \
-	service/class-splitting/ClassSplitting.cpp \
 	service/cross-dex-ref-minimizer/CrossDexRefMinimizer.cpp \
 	service/constant-propagation/ConstantPropagation.cpp \
 	service/constant-propagation/ConstantPropagationAnalysis.cpp \
@@ -287,6 +290,7 @@ libredex_la_SOURCES = \
 	service/dedup-blocks/DedupBlockValueNumbering.cpp \
 	service/escape-analysis/BlamingAnalysis.cpp \
 	service/escape-analysis/LocalPointersAnalysis.cpp \
+	service/atomic-field-updaters/AtomicFieldUpdaters.cpp \
 	service/field-ops/FieldOpTracker.cpp \
 	service/init-classes/InitClassPruner.cpp \
 	service/init-deps/InitDeps.cpp \
@@ -330,7 +334,11 @@ libredex_la_SOURCES = \
 	service/resources/ReachableResources.cpp \
 	service/resources/StaticIds.cpp \
 	service/shrinker/Shrinker.cpp \
+	service/stringbuilder/StringBuilderAnalysis.cpp \
 	service/switch-dispatch/SwitchDispatch.cpp \
+	service/switch-partitioning/StringSwitchFinder.cpp \
+	service/switch-partitioning/StringSwitchTransform.cpp \
+	service/switch-partitioning/StringTreeMapTransform.cpp \
 	service/switch-partitioning/SwitchEquivFinder.cpp \
 	service/switch-partitioning/SwitchEquivPrerequisites.cpp \
 	service/type-analysis/GlobalTypeAnalyzer.cpp \
@@ -345,6 +353,7 @@ libredex_la_SOURCES = \
 	shared/DexEncoding.cpp \
 	shared/file-utils.cpp \
 	util/CommandProfiling.cpp \
+	util/Histogram.cpp \
 	util/JemallocUtil.cpp \
 	util/Sha1.cpp
 
@@ -401,7 +410,6 @@ libopt_la_SOURCES = \
 	checkers/NoUnreachableInstructionsChecker.cpp \
 	checkers/NoSpuriousGetClassCallsChecker.cpp \
 	checkers/RenameClassChecker.cpp \
-	analysis/max-depth/MaxDepthAnalysis.cpp \
 	analysis/ip-reflection-analysis/IPReflectionAnalysis.cpp \
 	opt/access-marking/AccessMarking.cpp \
 	opt/add-secondary-dex/AddSecondaryDexPass.cpp \
@@ -409,6 +417,7 @@ libopt_la_SOURCES = \
 	opt/analyze-pure-method/PureMethods.cpp \
 	opt/app_module_usage/AppModuleUsage.cpp \
 	opt/art-profile-writer/ArtProfileWriterPass.cpp \
+	opt/atomic-field-updater-lowering/AtomicFieldUpdaterLoweringPass.cpp \
 	opt/builder_pattern/BuilderAnalysis.cpp \
 	opt/builder_pattern/BuilderTransform.cpp \
 	opt/builder_pattern/RemoveBuilderPattern.cpp \
@@ -420,7 +429,6 @@ libopt_la_SOURCES = \
 	opt/class-merging/IntraDexClassMergingPass.cpp \
 	opt/class-merging/ModelSpecGenerator.cpp \
 	opt/class-reordering/ClassReorderingPass.cpp \
-	opt/class-splitting/ClassSplittingPass.cpp \
 	opt/clinit-batching/ClinitBatchingPass.cpp \
 	opt/clinit-batching/EarlyClassLoadsAnalysis.cpp \
 	opt/clinit-batching/StaticFieldDependencyGraph.cpp \
@@ -429,6 +437,8 @@ libopt_la_SOURCES = \
 	opt/constant-propagation/ConstantPropagationPass.cpp \
 	opt/constant-propagation/ConstantPropagationRuntimeAssert.cpp \
 	opt/constant-propagation/IPConstantPropagation.cpp \
+	opt/constant-propagation/ReserveAreEqualRefPass.cpp \
+	opt/constant-propagation/StringBuilderAppendChain.cpp \
 	opt/copy-propagation/CopyPropagationPass.cpp \
 	opt/cse/CommonSubexpressionEliminationPass.cpp \
 	opt/dedup_blocks/DedupBlocksPass.cpp \
@@ -441,6 +451,7 @@ libopt_la_SOURCES = \
 	opt/fully-qualify-layouts/FullyQualifyLayouts.cpp \
 	opt/init-classes/InitClassLoweringPass.cpp \
 	opt/insert_debug_info/InsertDebugInfoPass.cpp \
+	opt/insert-remarks-for-tracing/InsertRemarksForTracing.cpp \
 	opt/insert-source-blocks/InsertSourceBlocks.cpp \
 	opt/instrument/BlockInstrument.cpp \
 	opt/instrument/Instrument.cpp \
@@ -470,6 +481,7 @@ libopt_la_SOURCES = \
 	opt/optimize_enums/EnumAnalyzeGeneratedMethods.cpp \
 	opt/optimize_enums/EnumTransformer.cpp \
 	opt/optimize_enums/EnumUpcastAnalysis.cpp \
+	opt/optimize_enums/InlineEnumValues.cpp \
 	opt/optimize_enums/OptimizeEnumsAnalysis.cpp \
 	opt/optimize_enums/OptimizeEnums.cpp \
 	opt/optimize_enums/OptimizeEnumsUnmap.cpp \
@@ -486,7 +498,6 @@ libopt_la_SOURCES = \
 	opt/regalloc-fast/FastRegAlloc.cpp \
 	opt/remove-builders/RemoveBuilders.cpp \
 	opt/remove-builders/RemoveBuildersHelper.cpp \
-	opt/remove-interfaces/RemoveInterfacePass.cpp \
 	opt/remove-recursive-locks/RemoveRecursiveLocks.cpp \
 	opt/remove_redundant_check_casts/RemoveRedundantCheckCasts.cpp \
 	opt/remove-unreachable/RemoveUnreachable.cpp \
@@ -509,7 +520,6 @@ libopt_la_SOURCES = \
 	opt/resources-inlining-pass/ResourcesInliningPass.cpp \
 	opt/resource-value-merging-pass/ResourceValueMergingPass.cpp \
 	opt/resource-value-merging-pass/Styles.cpp \
-	opt/shorten-srcstrings/Shorten.cpp \
 	opt/shrinker/ShrinkerPass.cpp \
 	opt/shrinker/TailDuplicationPass.cpp \
 	opt/unreachable/UnreachableLoweringPass.cpp \
@@ -541,8 +551,10 @@ libopt_la_SOURCES = \
 	opt/object-escape-analysis/ObjectEscapeAnalysis.cpp \
 	opt/staticrelo/StaticReloV2.cpp \
 	opt/string_concatenator/StringConcatenator.cpp \
+	opt/string-switch-analysis/StringSwitchTransformPass.cpp \
 	opt/stringbuilder-outliner/StringBuilderOutliner.cpp \
 	opt/strip-debug-info/StripDebugInfo.cpp \
+	opt/synthetic-block-counts/SyntheticBlockCounts.cpp \
 	opt/optimize_resources/LowerResourceConstants.cpp \
 	opt/optimize_resources/MaterializeResourceConstants.cpp \
 	opt/optimize_resources/OptimizeResources.cpp \

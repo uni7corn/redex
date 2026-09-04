@@ -6,8 +6,10 @@
  */
 
 /*
- * This pass sorts non-perf sensitive classes according to their inheritance
- * hierarchies in each dex. This improves compressibility.
+ * MethodClosures discovers the splittable closures of a method: suffix
+ * closures (the reachable set running to a return) and cold regions (SESE
+ * hammocks embedded in hot methods). It builds the reduced CFG and runs the
+ * dominator / post-dominator analysis that region detection relies on.
  */
 #include "MethodClosures.h"
 
@@ -130,69 +132,98 @@ void split_blocks(DexMethod* method,
 
 namespace method_splitting_impl {
 
-std::shared_ptr<const ReducedControlFlowGraph> reduce_cfg(
-    DexMethod* method, std::optional<uint64_t> split_block_size) {
+void normalize_cfg_for_splitting(DexMethod* method,
+                                 std::optional<uint64_t> split_block_size) {
   auto* code = method->get_code();
   auto& cfg = code->cfg();
-  for (auto* block : cfg.blocks()) {
-    auto* goes_to_block = block->goes_to_only_edge();
-    if (goes_to_block == nullptr) {
-      continue;
-    }
-    auto first_insn_it = goes_to_block->get_first_insn();
-    if (first_insn_it == goes_to_block->end()) {
-      continue;
-    }
-    if (opcode::is_a_return(first_insn_it->insn->opcode())) {
-      auto* last_existing_sb = source_blocks::get_last_source_block(block);
-      auto it = goes_to_block->begin();
-      while (true) {
-        switch (it->type) {
-        case MFLOW_OPCODE:
-          block->push_back(new IRInstruction(*it->insn));
-          break;
-        case MFLOW_SOURCE_BLOCK: {
-          auto sb_copy = std::make_unique<SourceBlock>(*it->src_block);
-          if (last_existing_sb != nullptr) {
-            source_blocks::normalize::normalize(last_existing_sb, sb_copy.get(),
-                                                sb_copy->vals_size);
-          }
-          block->insert_before(block->end(), std::move(sb_copy));
-          break;
-        }
-        default:
-          break;
-        }
-        if (it == first_insn_it) {
-          break;
-        }
-        it++;
+  // The loop below merges any return-only successor block into its sole
+  // predecessor and deletes the successor's incoming edge. A rejoin block whose
+  // only instruction is a `return` therefore does not survive: the return is
+  // appended to the cold predecessor, whose branchingness becomes
+  // BRANCH_RETURN, and cold-region discovery's non-return-entry filter then
+  // rejects it without surfacing a useful error. A rejoin needs at least one
+  // non-return instruction to survive this.
+  bool changed;
+  do {
+    changed = false;
+    for (auto* block : cfg.blocks()) {
+      auto* goes_to_block = block->goes_to_only_edge();
+      if (goes_to_block == nullptr) {
+        continue;
       }
-      auto goes_to_block_sb =
-          source_blocks::gather_source_blocks(goes_to_block);
-      // TODO(T225634378) - When we improve our profiling data to include proper
-      // hit counts, we need to adjust these source blocks in goes_to_block_sb
-      // to be scaled down as well
-      cfg.delete_succ_edges(block);
+      auto first_insn_it = goes_to_block->get_first_insn();
+      if (first_insn_it == goes_to_block->end()) {
+        continue;
+      }
+      if (opcode::is_a_return(first_insn_it->insn->opcode())) {
+        auto* last_existing_sb = source_blocks::get_last_source_block(block);
+        auto it = goes_to_block->begin();
+        while (true) {
+          switch (it->type) {
+          case MFLOW_OPCODE:
+            block->push_back(new IRInstruction(*it->insn));
+            break;
+          case MFLOW_SOURCE_BLOCK: {
+            auto sb_copy = std::make_unique<SourceBlock>(*it->src_block);
+            if (last_existing_sb != nullptr) {
+              source_blocks::normalize::normalize(
+                  last_existing_sb, sb_copy.get(), sb_copy->vals_size);
+            }
+            block->insert_before(block->end(), std::move(sb_copy));
+            break;
+          }
+          default:
+            break;
+          }
+          if (it == first_insn_it) {
+            break;
+          }
+          it++;
+        }
+        // TODO(T225634378) - When we improve our profiling data to include
+        // proper hit counts, we need to gather the source blocks of
+        // `goes_to_block` here and scale them down as well.
+        cfg.delete_succ_edges(block);
+        changed = true;
+      }
     }
-  }
-  cfg.remove_unreachable_blocks();
+    cfg.remove_unreachable_blocks();
+  } while (changed);
   if (split_block_size) {
     split_blocks(method, cfg, *split_block_size);
   }
+}
 
+std::shared_ptr<const ReducedControlFlowGraph> reduce_cfg(DexMethod* method) {
+  auto& cfg = method->get_code()->cfg();
+  // Precondition: the CFG has been normalized. An unnormalized CFG still has
+  // return-only successors, and reducing over one yields a graph whose block
+  // shapes disagree with what the splitter later sees -- wrong quietly, rather
+  // than broken loudly. Cheap to check, so check it.
+  for (auto* block : cfg.blocks()) {
+    auto* goes_to = block->goes_to_only_edge();
+    if (goes_to == nullptr) {
+      continue;
+    }
+    auto first = goes_to->get_first_insn();
+    always_assert_log(first == goes_to->end() ||
+                          !opcode::is_a_return(first->insn->opcode()),
+                      "reduce_cfg: CFG not normalized -- call "
+                      "normalize_cfg_for_splitting first (%s)",
+                      SHOW(method));
+  }
   return std::make_shared<const ReducedControlFlowGraph>(cfg);
 }
 
-std::shared_ptr<MethodClosures> discover_closures(
-    DexMethod* method, std::shared_ptr<const ReducedControlFlowGraph> rcfg) {
+std::vector<Closure> SuffixStrategy::discover(
+    DexMethod* method, const ReducedControlFlowGraph& rcfg) const {
   std::vector<Closure> closures;
   Lazy<monitor_count::Analyzer> mca([method] {
     return std::make_unique<monitor_count::Analyzer>(method->get_code()->cfg());
   });
-  auto excluded_blocks = get_blocks_with_final_field_puts(method, rcfg.get());
-  for (const auto* reduced_block : rcfg->blocks()) {
-    if (reduced_block == rcfg->entry_block()) {
+  auto excluded_blocks = get_blocks_with_final_field_puts(method, &rcfg);
+  for (const auto* reduced_block : rcfg.blocks()) {
+    if (reduced_block == rcfg.entry_block()) {
       continue;
     }
     bool any_throw{false};
@@ -200,7 +231,8 @@ std::shared_ptr<MethodClosures> discover_closures(
     bool too_many_targets{false};
     UnorderedSet<cfg::Block*> srcs;
     cfg::Block* target{nullptr};
-    for (const auto* e : reduced_block->expand_preds()) {
+    auto expanded_preds = reduced_block->expand_preds();
+    for (const auto* e : UnorderedIterable(expanded_preds)) {
       if (e->type() == cfg::EDGE_THROW) {
         any_throw = true;
         break;
@@ -225,14 +257,21 @@ std::shared_ptr<MethodClosures> discover_closures(
       // TODO: Consider splitting the block?
       continue;
     }
-    auto reachable = rcfg->reachable(reduced_block);
+    auto reachable = rcfg.reachable(reduced_block);
     if (unordered_any_of(excluded_blocks,
-                         [&](auto* e) { return reachable.count(e); })) {
+                         [&](auto* e) { return reachable.contains(e); })) {
       continue;
     }
     closures.push_back((Closure){reduced_block, std::move(reachable),
                                  std::move(srcs), target});
   }
+  return closures;
+}
+
+std::shared_ptr<MethodClosures> discover_closures(
+    DexMethod* method, std::shared_ptr<const ReducedControlFlowGraph> rcfg) {
+  SuffixStrategy strategy;
+  auto closures = strategy.discover(method, *rcfg);
   if (closures.empty()) {
     return nullptr;
   }

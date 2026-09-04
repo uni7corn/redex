@@ -9,10 +9,13 @@
 
 #include <vector>
 
+#include "Debug.h"
 #include "RedexContext.h"
 
-#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/regex.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <charconv>
 #include <fstream>
 #include <iostream>
@@ -463,9 +466,18 @@ void parse_manual_files(
     AllInteractions& method_stats,
     std::vector<MethodProfiles::ManualProfileLine>& unresolved_manual_lines) {
   Timer t("parse_manual_files");
-  for (const auto& [manual_file, config_name] :
-       UnorderedIterable(manual_file_to_config_names)) {
-    parse_manual_file(manual_file, config_name, baseline_profile_method_map,
+  // Two of the writes below are order-sensitive, so the files have to be
+  // visited in a fixed order rather than in the map's iteration order:
+  // parse_manual_file assigns baseline_manual_interactions[config] with
+  // last-write-wins, and a config may be listed in more than one file; and the
+  // rows it contributes to the shared method_stats are emplaced first-wins, so
+  // when two files name the same method and interaction, whichever file is
+  // parsed first decides the stats that survive.
+  auto ordered_files = unordered_to_ordered_keys(manual_file_to_config_names);
+  for (const auto& manual_file : ordered_files) {
+    auto it = manual_file_to_config_names.find(manual_file);
+    always_assert(it != manual_file_to_config_names.end());
+    parse_manual_file(manual_file, it->second, baseline_profile_method_map,
                       baseline_manual_interactions, manual_profile_interactions,
                       method_stats, unresolved_manual_lines);
   }
@@ -926,21 +938,47 @@ MethodProfiles::get_unresolved_method_descriptor_tokens() const {
   return result;
 }
 
-void MethodProfiles::resolve_method_descriptor_tokens(
+MethodProfiles::ResolutionStats
+MethodProfiles::resolve_method_descriptor_tokens(
     const UnorderedMap<dex_member_refs::MethodDescriptorTokens,
                        std::vector<DexMethodRef*>>& map) {
-  resolve_method_descriptor_tokens(map, true);
-  resolve_method_descriptor_tokens(map, false);
+  // The keys of `map` are MethodDescriptorTokens, which are non-owning
+  // string_views into the ref_str buffers of BOTH
+  // m_baseline_profile_unresolved_lines and m_unresolved_lines (see
+  // get_unresolved_method_descriptor_tokens, which merges the two). Erasing
+  // from either vector destroys those buffers, so neither erasure may happen
+  // until both variants have finished looking keys up. Otherwise the second
+  // lookup hashes and compares keys that point into freed memory.
+  auto baseline = resolve_method_descriptor_tokens(map, true);
+  auto main = resolve_method_descriptor_tokens(map, false);
+  erase_resolved_lines(m_baseline_profile_unresolved_lines, baseline.to_remove);
+  erase_resolved_lines(m_unresolved_lines, main.to_remove);
+  return ResolutionStats{
+      /* lines_resolved */ main.to_remove.size(),
+      /* rows_added */ main.added,
+      /* baseline_lines_resolved */ baseline.to_remove.size(),
+      /* baseline_rows_added */ baseline.added,
+  };
 }
 
-void MethodProfiles::resolve_method_descriptor_tokens(
+void MethodProfiles::erase_resolved_lines(
+    std::vector<ParsedMain>& unresolved_lines_ref,
+    const UnorderedSet<std::string*>& to_remove) {
+  std::erase_if(unresolved_lines_ref, [&to_remove](auto& parsed_main) {
+    return to_remove.count(parsed_main.ref_str.get());
+  });
+}
+
+MethodProfiles::VariantResolution
+MethodProfiles::resolve_method_descriptor_tokens(
     const UnorderedMap<dex_member_refs::MethodDescriptorTokens,
                        std::vector<DexMethodRef*>>& map,
     bool baseline_profile_variant) {
   size_t removed{0};
   size_t added{0};
   // Note that we don't remove unresolved_lines_ref as we go, as the given map
-  // might reference its mdts.
+  // might reference its mdts. The caller performs the removal, once both
+  // variants are done, for the same reason.
   UnorderedSet<std::string*> to_remove;
   auto& unresolved_lines_ref = baseline_profile_variant
                                    ? m_baseline_profile_unresolved_lines
@@ -967,13 +1005,11 @@ void MethodProfiles::resolve_method_descriptor_tokens(
       added++;
     }
   }
-  std::erase_if(unresolved_lines_ref, [&to_remove](auto& parsed_main) {
-    return to_remove.count(parsed_main.ref_str.get());
-  });
   TRACE(METH_PROF, 1,
         "After resolving unresolved lines: %zu unresolved lines removed, %zu "
         "rows added",
         removed, added);
+  return VariantResolution{std::move(to_remove), added};
 }
 
 bool MethodProfiles::parse_header(std::string_view line) {
@@ -1084,18 +1120,26 @@ dexmethods_profiled_comparator::dexmethods_profiled_comparator(
                 return false;
               }
 
-              // Give priority to interactions that happen more often
-              const auto& a_interactions =
-                  m_method_profiles->get_interaction_count(a);
-              const auto& b_interactions =
-                  m_method_profiles->get_interaction_count(b);
-              if (a_interactions != std::nullopt &&
-                  b_interactions != std::nullopt) {
-                return *a_interactions > *b_interactions;
-              }
+              // Give priority to interactions that happen more often, ranking
+              // any interaction with a known count above one without. Comparing
+              // a counted against an uncounted interaction alphabetically
+              // instead would not be a strict weak ordering: with counts Feed=5
+              // and Story=10 and an uncounted Notifications, Story < Feed by
+              // count, Notifications < Story alphabetically, and Feed <
+              // Notifications alphabetically, which is a cycle. std::sort on an
+              // intransitive comparator is undefined behaviour.
+              //
+              // std::optional orders nullopt below every value, which is
+              // exactly that ranking. Do not spell it with a sentinel: in
+              // `count ? *count : -1` the usual arithmetic conversions turn -1
+              // into UINT32_MAX, which sorts uncounted first instead of last.
+              auto a_count = m_method_profiles->get_interaction_count(a);
+              auto b_count = m_method_profiles->get_interaction_count(b);
 
-              // fall back to alphabetical
-              return a < b;
+              // Ties -- equal counts, or two uncounted interactions -- fall
+              // back to alphabetical, so the unstable sort has nothing left to
+              // decide.
+              return a_count == b_count ? a < b : a_count > b_count;
             });
 
   for (auto* method : initial_order) {

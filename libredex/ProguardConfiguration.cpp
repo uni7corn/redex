@@ -60,9 +60,10 @@ std::string show_access_flags(const DexAccessFlags flags,
     if ((flags & access) == 0) {
       continue;
     }
-    if (is_interface(access)) {
-      ss << "@";
-    }
+    // No '@' here: `show_access` returns "interface" for ACC_INTERFACE and
+    // "@interface" for ACC_ANNOTATION, which are different kinds of rule.
+    // Prefixing the interface flag turned "interface Foo" into
+    // "@interface Foo", which matches annotations instead.
     ss << show_access(access, isMethod) << " ";
   }
   for (int offset = 0; offset < 32; offset++) {
@@ -71,9 +72,6 @@ std::string show_access_flags(const DexAccessFlags flags,
       continue;
     }
     ss << "!";
-    if (is_interface(access)) {
-      ss << "@";
-    }
     ss << show_access(access, isMethod) << " ";
   }
   return ss.str();
@@ -182,14 +180,15 @@ std::ostream& operator<<(std::ostream& text, const KeepSpec& keep_rule) {
   }
   text << show_access_flags(
       class_spec.setAccessFlags, class_spec.unsetAccessFlags, false);
-  if (is_annotation(class_spec.setAccessFlags)) {
-    if (is_enum(class_spec.setAccessFlags)) {
-      if (is_interface(class_spec.setAccessFlags)) {
-        text << "interface ";
-      } else {
-        text << "class ";
-      }
-    }
+  // `show_access_flags` above already emits the kind for a rule that names one
+  // - "enum", "@interface". A rule that names none is a plain class rule, and
+  // has to say so: written as nested ifs, this printed a kind only for a rule
+  // that was annotation and enum at once, so "-keep class Foo" round-tripped
+  // to "-keep Foo", which ProGuard does not accept back.
+  if (!is_annotation(class_spec.setAccessFlags) &&
+      !is_enum(class_spec.setAccessFlags) &&
+      !is_interface(class_spec.setAccessFlags)) {
+    text << "class ";
   }
   for (std::size_t i = 0; i < class_spec.classNames.size(); i++) {
     text << (class_spec.classNames[i].negated ? "!" : "")

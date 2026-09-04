@@ -10,11 +10,11 @@
 #include <fstream>
 
 #include <sparta/AbstractDomain.h>
-#include <sparta/PatriciaTreeMapAbstractEnvironment.h>
 #include <sparta/PatriciaTreeMapAbstractPartition.h>
 
 #include "CallGraph.h"
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "Show.h"
 #include "SpartaInterprocedural.h"

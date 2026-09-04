@@ -12,12 +12,12 @@
 #include <iomanip>
 #include <ostream>
 
-#include <sparta/FiniteAbstractDomain.h>
 #include <sparta/PatriciaTreeMapAbstractEnvironment.h>
 #include <sparta/ReducedProductAbstractDomain.h>
 
 #include "BaseIRAnalyzer.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "IRInstruction.h"

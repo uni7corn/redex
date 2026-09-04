@@ -7,6 +7,9 @@
 
 #include "Configurable.h"
 
+#include <set>
+
+#include "Debug.h"
 #include "DexClass.h"
 
 template <typename T>
@@ -198,7 +201,9 @@ void Configurable::parse_config(const JsonWrapper& json) {
          const std::tuple<std::string, Configurable::Reflection>& param_type,
          const Json::Value& default_value) {};
   m_trait_reflector = [](const std::string&, const Json::Value&) {};
-  m_parser = [&json](const std::string& name) {
+  std::set<std::string> bound;
+  m_parser = [&json, &bound](const std::string& name) {
+    bound.insert(name);
     // TODO: add std::string API for contains
     if (json.contains(name.c_str())) {
       return OptJsonVal(json[name.c_str()]);
@@ -207,6 +212,15 @@ void Configurable::parse_config(const JsonWrapper& json) {
     }
   };
   bind_config();
+  m_parser = [](const std::string&) { return OptJsonVal{}; };
+  // "disabled" is read straight off the JSON by PassManager, never bound here.
+  for (const auto& name : json.unwrap().getMemberNames()) {
+    if (name == "disabled" || bound.count(name) != 0) {
+      continue;
+    }
+    fprintf(stderr, "WARNING: \"%s\" has no parameter \"%s\"; value ignored.\n",
+            get_config_name().c_str(), name.c_str());
+  }
   // m_after_configuration may have been set in bind_config()
   if (m_after_configuration) {
     m_after_configuration();
@@ -246,7 +260,6 @@ Configurable::Reflection Configurable::reflect() {
         default:
           not_reached_log("Invalid Configurable::ReflectionParam::Type: %d",
                           param_type_tag);
-          break;
         }
       };
   m_trait_reflector = [&cr](const std::string& name, const Json::Value& value) {
@@ -261,6 +274,13 @@ template <>
 float Configurable::as<float>(const Json::Value& value, bindflags_t bindflags) {
   ASSERT_NO_BINDFLAGS(float);
   return value.asFloat();
+}
+
+template <>
+double Configurable::as<double>(const Json::Value& value,
+                                bindflags_t bindflags) {
+  ASSERT_NO_BINDFLAGS(double);
+  return value.asDouble();
 }
 
 template <>
@@ -538,6 +558,7 @@ Json::Value Configurable::as<Json::Value>(const Json::Value& value,
 // NOLINTEND(bugprone-macro-parentheses)
 
 IMPLEMENT_REFLECTOR(float)
+IMPLEMENT_REFLECTOR(double)
 IMPLEMENT_REFLECTOR_WITH_DFLT_VALUE(bool)
 IMPLEMENT_REFLECTOR_EX(std::optional<bool>, "bool")
 IMPLEMENT_REFLECTOR_EX(int, "int")

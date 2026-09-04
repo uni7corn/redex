@@ -7,6 +7,7 @@
 
 #include "GlobalConfig.h"
 
+#include "Debug.h"
 #include <utility>
 
 void InlinerConfig::bind_config() {
@@ -29,6 +30,10 @@ void InlinerConfig::bind_config() {
   bind("max_cost_for_constant_propagation", max_cost_for_constant_propagation,
        max_cost_for_constant_propagation);
   bind("max_reduced_size", max_reduced_size, max_reduced_size);
+  bind("max_partially_inlined_code_units", max_partially_inlined_code_units,
+       max_partially_inlined_code_units,
+       "Maximum estimated code units of the hot prefix retained when partially "
+       "inlining a callee.");
   bind("multiple_callers", multiple_callers, multiple_callers);
   bind("use_call_site_summaries", use_call_site_summaries,
        use_call_site_summaries);
@@ -213,11 +218,61 @@ void ProguardConfig::bind_config() {
 void PassManagerConfig::bind_config() {
   bind("pass_aliases", pass_aliases, pass_aliases);
   bind("jemalloc_full_stats", jemalloc_full_stats, jemalloc_full_stats);
-  bind("violations_tracking", violations_tracking, violations_tracking);
   bind("check_pass_order_properties", check_pass_order_properties,
        check_pass_order_properties);
   bind("check_properties_deep", check_properties_deep, check_properties_deep);
   bind("dump_mrefs", dump_mrefs, dump_mrefs);
+
+  // This setting moved to its own config. Unbound keys are silently dropped by
+  // Configurable, so without this an old config would keep parsing and quietly
+  // stop tracking anything -- the worst outcome for a diagnostic feature.
+  bool moved_violations_tracking = false;
+  bind("violations_tracking", false, moved_violations_tracking,
+       "Removed: set `violations_tracking.enabled` at the top level instead.");
+  always_assert_log(!moved_violations_tracking,
+                    "pass_manager.violations_tracking has moved. Set "
+                    "violations_tracking.enabled instead:\n"
+                    "  \"violations_tracking\": { \"enabled\": true }");
+}
+
+void ViolationsTrackingConfig::bind_config() {
+  bind("enabled", enabled, enabled,
+       "Track how many source-block violations each pass introduces, and "
+       "report them as `~violation~tracking` metrics of that pass.");
+  bind("violation_kinds", violation_kinds, violation_kinds,
+       "Which kinds of violation to track. Valid names are ChainAndDom, "
+       "HotImmediateDomNotHot, HotAllChildrenCold, HotMethodColdEntry, "
+       "UncoveredSourceBlocks, HotNoHotPred and "
+       "UncoveredThrowDelineatedBlocks. Several kinds share one pass over the "
+       "scope, so naming more than one costs little extra. With a single kind "
+       "the metrics are reported flat; with several, each kind gets a "
+       "sub-scope named after it. Note that sharing the pass also shares the "
+       "CFG: kinds whose counters need unreachable blocks removed do so for "
+       "the whole method, so a kind that would otherwise see those blocks "
+       "counts fewer violations when co-configured with one of them. Counts "
+       "are therefore only comparable between runs that name the same set of "
+       "kinds.");
+  bind("top_n", top_n, top_n,
+       "How many of the worst-offending methods to report per pass.");
+  bind("methods_to_vis", methods_to_vis, methods_to_vis,
+       "Methods whose violating blocks are printed in full, in addition to "
+       "the aggregate counts.");
+  bind("source_blocks_to_track", source_blocks_to_track, source_blocks_to_track,
+       "Track only the methods that carry these source blocks, instead of the "
+       "whole scope. Each entry is a `<method>@<id>` descriptor as printed by "
+       "SourceBlock::show, or a bare `<method>` to match every block "
+       "attributed to it. Descriptors are re-resolved every pass, so a block "
+       "is followed as inlining moves or duplicates it, and every carrier "
+       "method is reported even when it has no violations.");
+  bind("track_intermethod_violations", track_intermethod_violations,
+       track_intermethod_violations,
+       "Also track inter-method (hot callee with all-cold callers) "
+       "violations. This builds a call graph twice per pass.");
+  bind("print_all_violations", print_all_violations, print_all_violations,
+       "Print every violating block of every method, not just the ones named "
+       "by methods_to_vis.");
+  bind("ignore_undefined", ignore_undefined, ignore_undefined,
+       "Do not count source blocks with undefined values as violations.");
 }
 
 void ResourceConfig::bind_config() {
@@ -228,6 +283,19 @@ void ResourceConfig::bind_config() {
 
 void DexOutputConfig::bind_config() {
   bind("write_class_sizes", write_class_sizes, write_class_sizes);
+  bind("write_method_sizes", write_method_sizes, write_method_sizes,
+       "Record the authoritative post-lowering per-method code_item byte size "
+       "into enhanced_dex_stats_t::method_size. Forced on by --emit-dexvt.");
+  bind(
+      "emit_class_order_sample", emit_class_order_sample,
+      emit_class_order_sample,
+      "Emit a segment-aware, sampled class-placement fingerprint for "
+      "root-store (main-APK) classes into output_stats.class_order_sample, "
+      "used to compare class placement across builds per dex-ordering regime.");
+  bind("class_order_sample_cap", class_order_sample_cap, class_order_sample_cap,
+       "Target number of sampled classes in the cold (cross-dex-ref-minimized) "
+       "segment when emit_class_order_sample is set; the primary and betamap "
+       "segments are always kept in full.");
 }
 
 void JarLoaderConfig::bind_config() {
@@ -280,10 +348,16 @@ void GlobalConfig::bind_config() {
   bind("enable_object_domain_null_check_elim", false, bool_param,
        "When true, enable null check elimination for object domains "
        "(NewObjectDomain, SingletonObjectDomain, ObjectWithImmutAttrDomain)");
+  bind("enable_check_cast_value_preservation", false, bool_param,
+       "When true, constant propagation keeps a `check-cast` operand's value "
+       "across the cast, instead of carrying only null");
   bind("enable_known_non_null_returns", false, bool_param,
        "When true, mark return values of well-known external methods as "
        "non-null in constant propagation, enabling removal of redundant "
        "Kotlin null-check intrinsics");
+  bind("enable_param_exit_value_summary", false, bool_param,
+       "When true, infer a per-parameter exit-value summary via IPCP and use "
+       "it to refine no-throw facts on statically-dispatched invoke edges");
   bind("enable_replacing_areequal", false, bool_param,
        "When true, replace Kotlin Intrinsics.areEqual with Object.equals "
        "when the receiver is proven non-null by constant propagation");
@@ -297,6 +371,7 @@ void GlobalConfig::bind_config() {
   bind("lower_with_cfg", {}, bool_param);
   bind("no_optimizations_annotations", {}, string_vector_param);
   bind("no_optimizations_blocklist", {}, string_vector_param);
+  bind("preserve_count_integrity", false, bool_param);
   bind("preserve_input_dexes", {}, bool_param);
   bind("proguard_map", "", string_param);
   bind("prune_unexported_components", {}, string_vector_param);
@@ -308,6 +383,7 @@ void GlobalConfig::bind_config() {
   bind("write_cfg_each_pass", false, bool_param);
   bind("dump_cfg_classes", "", string_param);
   bind("slow_invariants_debug", false, bool_param);
+  bind("insert_remarks", false, bool_param);
   // Enabled for ease of testing, apps expected to opt-out
   bind("enable_bleeding_edge_app_bundle_support", true, bool_param);
   bind("no_devirtualize_annos", {}, string_vector_param);
@@ -353,6 +429,7 @@ GlobalConfigRegistry& GlobalConfig::default_registry() {
       register_as<MethodSimilarityOrderingConfig>("method_similarity_order"),
       register_as<ProguardConfig>("proguard"),
       register_as<PassManagerConfig>("pass_manager"),
+      register_as<ViolationsTrackingConfig>("violations_tracking"),
       register_as<ResourceConfig>("resources"),
       register_as<DexOutputConfig>("dex_output"),
       register_as<JarLoaderConfig>("jar_loader"),

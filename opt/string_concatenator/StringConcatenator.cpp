@@ -12,10 +12,12 @@
 #include <utility>
 
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "IRCode.h"
+#include "MethodUtil.h"
 #include "PassManager.h"
 #include "Resolver.h"
 #include "Show.h"
@@ -121,13 +123,8 @@ struct ConcatenatorConfig {
     init_string = DexMethod::get_method(
         "Ljava/lang/StringBuilder;.<init>:(Ljava/lang/String;)V");
     always_assert(init_string != nullptr);
-    append = DexMethod::get_method(
-        "Ljava/lang/StringBuilder;.append:(Ljava/lang/String;)Ljava/lang/"
-        "StringBuilder;");
-    always_assert(append != nullptr);
-    to_string = DexMethod::get_method(
-        "Ljava/lang/StringBuilder;.toString:()Ljava/lang/String;");
-    always_assert(to_string != nullptr);
+    append = method::java_lang_StringBuilder_append_String();
+    to_string = method::java_lang_StringBuilder_toString();
   }
 };
 

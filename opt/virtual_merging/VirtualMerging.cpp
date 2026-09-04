@@ -47,6 +47,7 @@
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
 #include "CppUtil.h"
+#include "Debug.h"
 #include "DedupVirtualMethods.h"
 #include "GlobalConfig.h"
 #include "IRCode.h"
@@ -54,6 +55,7 @@
 #include "Inliner.h"
 #include "MethodProfiles.h"
 #include "PassManager.h"
+#include "RedexContext.h"
 #include "Resolver.h"
 #include "Show.h"
 #include "SourceBlocks.h"
@@ -105,7 +107,7 @@ VirtualMerging::VirtualMerging(DexStoresVector& stores,
     : m_scope(build_class_scope(stores)),
       m_xstores(stores, conf.normal_primary_dex()),
       m_xdexes(stores),
-      m_type_system(m_scope),
+      m_vscopes(m_scope),
       m_max_overriding_method_instructions(max_overriding_method_instructions),
       m_inliner_config(std::move(inliner_config)),
       m_init_classes_with_side_effects(m_scope,
@@ -158,8 +160,7 @@ void VirtualMerging::find_unsupported_virtual_scopes() {
       invoke_super_unresolved_method_refs.size();
 
   for (const auto* method : UnorderedIterable(invoke_super_methods)) {
-    m_unsupported_virtual_scopes.insert(
-        m_type_system.find_virtual_scope(method));
+    m_unsupported_virtual_scopes.insert(m_vscopes.find(method));
   }
 
   for (const auto* method :
@@ -182,14 +183,13 @@ void VirtualMerging::compute_mergeable_scope_methods() {
     always_assert(!overriding_method->is_external());
     always_assert(overriding_method->get_code());
 
-    const auto* virtual_scope =
-        m_type_system.find_virtual_scope(overriding_method);
+    const auto* virtual_scope = m_vscopes.find(overriding_method);
     if (virtual_scope == nullptr) {
       TRACE(VM, 1, "[VM] virtual method {%s} has no virtual scope!",
             SHOW(overriding_method));
       return;
     }
-    if (virtual_scope->type == overriding_method->get_class()) {
+    if (virtual_scope->root() == overriding_method->get_class()) {
       // Actually, this method isn't overriding anything.
       return;
     }
@@ -211,7 +211,7 @@ void VirtualMerging::compute_mergeable_scope_methods() {
 
     m_mergeable_scope_methods.update(
         virtual_scope,
-        [&](const VirtualScope*,
+        [&](const ::virtual_scope::VirtualScope*,
             UnorderedSet<const DexMethod*>& s,
             bool /* exists */) { s.emplace(overriding_method); });
   });
@@ -319,7 +319,7 @@ class MergePairsBuilder {
  public:
   using PairSeq = std::vector<std::pair<const DexMethod*, const DexMethod*>>;
 
-  MergePairsBuilder(const VirtualScope* virtual_scope,
+  MergePairsBuilder(const ::virtual_scope::VirtualScope* virtual_scope,
                     const OrderingProvider& ordering_provider,
                     const VirtualMerging::PerfConfig& perf_config)
       : virtual_scope(virtual_scope),
@@ -353,8 +353,7 @@ class MergePairsBuilder {
 
  private:
   bool init() {
-    for (const auto& p : virtual_scope->methods) {
-      auto* method = p.first;
+    for (const auto* method : virtual_scope->methods()) {
       methods.push_back(method);
       types_to_methods.emplace(method->get_class(), method);
       if (!can_rename(method) || root(method) ||
@@ -374,13 +373,13 @@ class MergePairsBuilder {
     MergeablesMap mergeable_pairs_map;
     // sorting to make things deterministic
     std::sort(methods.begin(), methods.end(), dexmethods_comparator());
-    for (DexMethod* overriding_method : methods) {
+    for (const DexMethod* overriding_method : methods) {
       if (mergeable_methods.count(overriding_method) == 0u) {
         continue;
       }
       stats.overriding_methods++;
       auto* subtype = overriding_method->get_class();
-      always_assert(subtype != virtual_scope->type);
+      always_assert(subtype != virtual_scope->root());
       auto* overriding_cls = type_class(overriding_method->get_class());
       always_assert(overriding_cls != nullptr);
       auto* supertype = overriding_cls->get_super_class();
@@ -405,7 +404,7 @@ class MergePairsBuilder {
             subtypes[t].push_back(trailing);
             return false;
           },
-          supertype, subtype, virtual_scope->type);
+          supertype, subtype, virtual_scope->root());
 
       bool found_override = run_fn(
           [this, &overriding_method, &mergeable_pairs_map, &xstores,
@@ -414,7 +413,7 @@ class MergePairsBuilder {
             if (it == types_to_methods.end()) {
               return false;
             }
-            auto* overridden_method = it->second;
+            const auto* overridden_method = it->second;
             if (!overridden_method->is_concrete() ||
                 is_native(overridden_method)) {
               stats.inconcrete_overridden_methods++;
@@ -434,7 +433,7 @@ class MergePairsBuilder {
             }
             return true;
           },
-          supertype, subtype, virtual_scope->type);
+          supertype, subtype, virtual_scope->root());
       always_assert(found_override);
     }
 
@@ -626,7 +625,7 @@ class MergePairsBuilder {
                 t_method, order_value);
           }
         },
-        virtual_scope->type);
+        virtual_scope->root());
     for (const auto& p : UnorderedIterable(override_map)) {
       redex_assert(p.second.empty());
     }
@@ -643,10 +642,10 @@ class MergePairsBuilder {
     return mergeable_pairs;
   }
 
-  const VirtualScope* virtual_scope;
+  const ::virtual_scope::VirtualScope* virtual_scope;
   const OrderingProvider& m_ordering_provider;
-  std::vector<DexMethod*> methods;
-  UnorderedMap<const DexType*, DexMethod*> types_to_methods;
+  std::vector<const DexMethod*> methods;
+  UnorderedMap<const DexType*, const DexMethod*> types_to_methods;
   UnorderedMap<const DexType*, std::vector<DexType*>> subtypes;
   LocalStats stats;
   const VirtualMerging::PerfConfig& m_perf_config;
@@ -662,18 +661,19 @@ VirtualMerging::compute_mergeable_pairs_by_virtual_scopes(
     const method_profiles::MethodProfiles& profiles,
     Strategy strategy,
     VirtualMergingStats& stats) const {
-  InsertOnlyConcurrentMap<const VirtualScope*, LocalStats> local_stats;
-  std::vector<const VirtualScope*> virtual_scopes;
+  InsertOnlyConcurrentMap<const ::virtual_scope::VirtualScope*, LocalStats>
+      local_stats;
+  std::vector<const ::virtual_scope::VirtualScope*> virtual_scopes;
   for (const auto& p : UnorderedIterable(m_mergeable_scope_methods)) {
     virtual_scopes.push_back(p.first);
   }
   InsertOnlyConcurrentMap<
-      const VirtualScope*,
+      const ::virtual_scope::VirtualScope*,
       std::vector<std::pair<const DexMethod*, const DexMethod*>>>
       mergeable_pairs_by_virtual_scopes;
   SimpleOrderingProvider ordering_provider{profiles};
   walk::parallel::virtual_scopes(
-      virtual_scopes, [&](const virt_scope::VirtualScope* virtual_scope) {
+      virtual_scopes, [&](const ::virtual_scope::VirtualScope* virtual_scope) {
         MergePairsBuilder mpb(virtual_scope, ordering_provider, m_perf_config);
         auto res = mpb.build(m_mergeable_scope_methods.at_unsafe(virtual_scope),
                              m_xstores, m_xdexes, profiles, strategy);
@@ -721,9 +721,10 @@ VirtualMerging::compute_mergeable_pairs_by_virtual_scopes(
 
 namespace {
 
-using MethodData = std::pair<
-    const DexMethod*,
-    std::vector<std::pair<const VirtualScope*, std::vector<const DexMethod*>>>>;
+using MethodData =
+    std::pair<const DexMethod*,
+              std::vector<std::pair<const ::virtual_scope::VirtualScope*,
+                                    std::vector<const DexMethod*>>>>;
 
 std::pair<std::vector<MethodData>, VirtualMergingStats> create_ordering(
     const VirtualMerging::MergeablePairsByVirtualScope& mergeable_pairs,
@@ -749,7 +750,7 @@ std::pair<std::vector<MethodData>, VirtualMergingStats> create_ordering(
           if (it == method_idx.end()) {
             ordering.emplace_back(
                 overridden_method,
-                std::vector<std::pair<const VirtualScope*,
+                std::vector<std::pair<const ::virtual_scope::VirtualScope*,
                                       std::vector<const DexMethod*>>>{});
             method_idx.emplace(overridden_method, ordering.size() - 1);
             method_data = &ordering.back();
@@ -770,7 +771,7 @@ std::pair<std::vector<MethodData>, VirtualMergingStats> create_ordering(
     }
 
     for (const auto& p : ordering) {
-      UnorderedSet<const VirtualScope*> scopes_seen;
+      UnorderedSet<const ::virtual_scope::VirtualScope*> scopes_seen;
       for (const auto& q : p.second) {
         redex_assert(scopes_seen.count(q.first) == 0);
         scopes_seen.insert(q.first);
@@ -868,10 +869,11 @@ std::pair<std::vector<MethodData>, VirtualMergingStats> create_ordering(
         // any-order-deterministic when removing candidates. It would probably
         // be good to do this well, e.g., work towards being able to remove
         // the most methods. But let's be simple for now.
-        UnorderedMap<const VirtualScope*, std::vector<const DexMethod*>*>
+        UnorderedMap<const ::virtual_scope::VirtualScope*,
+                     std::vector<const DexMethod*>*>
             data_map;
         data_map.reserve(p.second.size());
-        std::vector<const VirtualScope*> scopes;
+        std::vector<const ::virtual_scope::VirtualScope*> scopes;
         scopes.reserve(p.second.size());
 
         for (auto& q : p.second) {
@@ -884,8 +886,7 @@ std::pair<std::vector<MethodData>, VirtualMergingStats> create_ordering(
                     if (lhs == rhs) {
                       return false;
                     }
-                    return compare_dexmethods(lhs->methods.front().first,
-                                              rhs->methods.front().first);
+                    return compare_dexmethods(lhs->top_def(), rhs->top_def());
                   });
 
         size_t removals = 0;
@@ -990,6 +991,36 @@ struct SBHelper {
     };
   }
 
+  // The synthesized callsite for a dispatch arm, carrying `callee`'s own entry
+  // count: the arm is taken exactly as often as that method was called.
+  //
+  // The plain creator above fills one SCALAR across every interaction, which
+  // was adequate when a val meant "hot" but is meaningless as a count -- so the
+  // values are copied per interaction here, bounded by the shorter of the two
+  // as SourceBlock::add/max/min all do.
+  //
+  // A callee with no SourceBlock gives no basis for a count, so it falls back
+  // to the historical literal rather than inventing one or writing `none`,
+  // which would propagate as NaN through inlining's normalization.
+  std::function<std::unique_ptr<SourceBlock>()> get_source_block_creator_from(
+      const DexMethod* callee) const {
+    return [overridden_method = this->overridden,
+            template_sb = get_arbitrary_first_sb(), callee]() {
+      auto* callee_sb = source_blocks::get_first_source_block_of_method(callee);
+      if (callee_sb == nullptr) {
+        return source_blocks::clone_as_synthetic(template_sb, overridden_method,
+                                                 SourceBlock::Val{1.0, 0});
+      }
+      auto new_sb =
+          source_blocks::clone_as_synthetic(template_sb, overridden_method);
+      const size_t len = std::min(new_sb->vals_size, callee_sb->vals_size);
+      for (size_t i = 0; i < len; ++i) {
+        new_sb->apply_at(i, [&](auto& val) { val = callee_sb->get_at(i); });
+      }
+      return new_sb;
+    };
+  }
+
   struct ScopedSplitHelper {
     cfg::Block* block{nullptr};
     SourceBlock* first_sb{nullptr};
@@ -1030,7 +1061,7 @@ struct SBHelper {
             if (first_sb->get_val(i)) {
               const auto& first_val = first_sb->get_at(i);
               val->val += first_val->val;
-              val->appear100 = std::max(val->appear100, first_val->val);
+              val->appear100 = std::max(val->appear100, first_val->appear100);
             }
           });
         }
@@ -1285,9 +1316,16 @@ VirtualMergingStats apply_ordering(
         }
 
         if (sb_helper.create_source_blocks) {
-          // Insert source block with val == 1.0 so that inlining normalizes
-          // source-blocks properly
-          push_sb(sb_helper.get_source_block_creator(/* val */ 1.0)());
+          // The literal 1.0 was the coverage era's "hot": inlining's factor is
+          // callsite/callee_entry, so 1.0 over a callee entry of 1.0 was a
+          // no-op. Once vals carry counts, 1.0 means ONE execution and the
+          // factor collapses to 1/callee_entry -- a callee with entry 50000
+          // has its whole inlined body scaled by 2e-5 and pinned to the
+          // positive floor. Take the arm's count from the profile instead.
+          push_sb(
+              g_redex->preserve_count_integrity
+                  ? sb_helper.get_source_block_creator_from(overriding_method)()
+                  : sb_helper.get_source_block_creator(/* val */ 1.0)());
         }
 
         always_assert(1 + proto->get_args()->size() == param_regs.size());
@@ -1357,10 +1395,10 @@ VirtualMergingStats apply_ordering(
 
         virtual_methods_to_remove[type_class(overriding_method->get_class())]
             .push_back(overriding_method);
-        auto virtual_scope_root = virtual_scope->methods.front();
-        always_assert(overriding_method != virtual_scope_root.first);
-        virtual_methods_to_remap.emplace(overriding_method,
-                                         virtual_scope_root.first);
+        auto* virtual_scope_root =
+            const_cast<DexMethod*>(virtual_scope->top_def());
+        always_assert(overriding_method != virtual_scope_root);
+        virtual_methods_to_remap.emplace(overriding_method, virtual_scope_root);
 
         stats.removed_virtual_methods++;
       }

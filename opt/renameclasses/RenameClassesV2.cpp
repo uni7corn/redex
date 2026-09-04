@@ -7,7 +7,6 @@
 
 #include "RenameClassesV2.h"
 
-#include <algorithm>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/regex.hpp>
 #include <map>
@@ -16,6 +15,7 @@
 
 #include "ClassUtil.h"
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DexClass.h"
 #include "DexEncoding.h"
 #include "DexUtil.h"

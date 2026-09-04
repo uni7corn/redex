@@ -44,15 +44,20 @@ check_PROGRAMS = \
     array_propagation_test \
     arsc_attribution_test \
     assert_test \
+    atomic_field_updater_lowering_test \
     atomic_map_test \
     blaming_escape_test \
+    block_offset_sink_test \
     boxed_boolean_propagation_test \
     branch_prefix_hoisting_test \
+    bridge_synth_inline_pass_test \
+    call_site_summary_reductions_test \
     cfg_inliner_test \
     cfg_mutation_test \
     cfg_positions_test \
     chrome_trace_writer_test \
     class_checker_test \
+    class_order_sample_test \
     check_breadcrumbs_test \
     check_cast_analysis_test \
     clinit_batching_pass_test \
@@ -79,6 +84,7 @@ check_PROGRAMS = \
     dex_mutate_test \
     dex_output_test \
     dex_store_test \
+    dexvt_test \
     dex_structure_test \
     dex_type_environment_test \
     dex_util_test \
@@ -101,12 +107,14 @@ check_PROGRAMS = \
     instruction_sequence_outliner_test \
     int_type_patcher_test \
     interprocedural_constant_propagation_test \
+    ipcp_stringbuilder_append_chain_test \
     intraprocedural_constant_propagation_test \
     ir_assembler_test \
     ir_code_test \
     ir_instruction_test \
     ir_list_test \
     ir_typechecker_test \
+    jar_loader_test \
     java_parser_util_test \
     kotlin_lambda_analyzer_test \
     kotlin_lambda_dedup_pass_test \
@@ -120,7 +128,9 @@ check_PROGRAMS = \
     match_test \
     method_inline_test \
     method_splitting_test \
+    method_splitter_region_test_fixture_test \
     method_util_test \
+    metrics_sink_test \
     monitor_count_test \
     mutf8_compare_test \
     leb_test \
@@ -133,23 +143,29 @@ check_PROGRAMS = \
     outliner_type_analysis_test \
     partial_pass_test \
     peephole_test \
+    position_interning_test \
+    position_map_reader_test \
     print_kotlin_stats_test \
     proguard_lexer_test \
     proguard_map_test \
     proguard_matcher_test \
     proguard_parser_test \
+    proguard_print_configuration_test \
     proguard_regex_test \
     pure_analysis_test \
     random_forest_test \
+    reachable_natives_test \
     reaching_definitions_test \
     rearrange_enum_clinit_test \
     reduce_array_literals_test \
     reduce_boolean_branches_test \
     reduce_gotos_test \
     reduce_sparse_switches_test \
+    reduced_cfg_closure_adapter_test \
     reflection_analysis_test \
     reg_alloc_test \
     registers_test \
+    remark_test \
     remove_null_check_string_arg_test \
     remove_recursive_locks_test \
     remove_redundant_check_casts_test \
@@ -166,11 +182,15 @@ check_PROGRAMS = \
     signed_constant_propagation_test \
     compact_pointer_vector_test \
     source_blocks_test \
+    synthetic_block_counts_test \
     split_huge_switch_test \
     static_field_dependency_graph_test \
     static_relo_v2_test \
+    stringbuilder_append_chain_test \
     stringbuilder_outline_test \
     strip_debug_info_test \
+    string_switch_test \
+    string_switch_transform_test \
     switch_dispatch_test \
     switch_equiv_test \
     throw_propagation_test \
@@ -188,6 +208,8 @@ check_PROGRAMS = \
     used_vars_test \
     virt_scope_test \
     virtual_merging_test \
+    virtual_scopes_differential_test \
+    virtual_scopes_test \
     walkers_test \
     work_queue_test \
     xstorerefs_test \
@@ -210,14 +232,22 @@ arsc_attribution_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/tools/arsc -I$(t
 
 assert_test_SOURCES = AssertTest.cpp
 
+atomic_field_updater_lowering_test_SOURCES = AtomicFieldUpdaterLoweringTest.cpp
+
 atomic_stat_counter_test_SOURCES = AtomicStatCounterTest.cpp
 
 blaming_escape_test_SOURCES = BlamingEscapeTest.cpp
+
+block_offset_sink_test_SOURCES = BlockOffsetSinkTest.cpp
 blaming_escape_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 boxed_boolean_propagation_test_SOURCES = constant-propagation/BoxedBooleanPropagationTest.cpp
 
 branch_prefix_hoisting_test_SOURCES = BranchPrefixHoistingTest.cpp ScopeHelper.cpp
+
+bridge_synth_inline_pass_test_SOURCES = BridgeSynthInlinePassTest.cpp
+
+call_site_summary_reductions_test_SOURCES = CallSiteSummaryReductionsTest.cpp
 
 cfg_inliner_test_SOURCES = CFGInlinerTest.cpp
 cfg_inliner_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -234,7 +264,11 @@ check_breadcrumbs_test_SOURCES = CheckBreadCrumbsTest.cpp
 
 check_cast_analysis_test_SOURCES = CheckCastAnalysisTest.cpp
 
+class_order_sample_test_SOURCES = ClassOrderSampleTest.cpp
+
 clinit_batching_pass_test_SOURCES = ClinitBatchingPassTest.cpp
+EXTRA_clinit_batching_pass_test_DEPENDENCIES = clinit_batching_pass_test.env
+$(eval $(call make_env,clinit_batching_pass_test,manifest=$(srcdir)/../integ/ClinitBatchingTestManifest.xml))
 
 class_checker_test_SOURCES = ClassCheckerTest.cpp ScopeHelper.cpp
 
@@ -295,6 +329,8 @@ dex_store_test_SOURCES = DexStoreTest.cpp
 
 dex_structure_test_SOURCES = DexStructureTest.cpp
 
+dexvt_test_SOURCES = DexVtTest.cpp
+
 dex_type_environment_test_SOURCES = type-analysis/DexTypeEnvironmentTest.cpp
 
 dex_util_test_SOURCES = DexUtilTest.cpp
@@ -344,6 +380,8 @@ instruction_sequence_outliner_test_SOURCES = InstructionSequenceOutlinerTest.cpp
 
 interprocedural_constant_propagation_test_SOURCES = constant-propagation/IPConstantPropagationTest.cpp
 
+ipcp_stringbuilder_append_chain_test_SOURCES = constant-propagation/IPCPStringBuilderAppendChainTest.cpp
+
 intraprocedural_constant_propagation_test_SOURCES = constant-propagation/ConstantPropagationTest.cpp
 intraprocedural_constant_propagation_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
@@ -358,6 +396,8 @@ ir_list_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 ir_typechecker_test_SOURCES = IRTypeCheckerTest.cpp
 ir_typechecker_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+jar_loader_test_SOURCES = JarLoaderTest.cpp
 
 java_parser_util_test_SOURCES = JavaParserUtilTest.cpp
 java_parser_util_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -394,7 +434,13 @@ tail_duplication_test_SOURCES = TailDuplicationTest.cpp
 
 method_splitting_test_SOURCES = MethodSplittingTest.cpp
 
+method_splitter_region_test_fixture_test_SOURCES = \
+	MethodSplitterRegionTestFixture.cpp \
+	MethodSplitterRegionTestFixtureTest.cpp
+
 method_util_test_SOURCES = MethodUtilTest.cpp
+
+metrics_sink_test_SOURCES = MetricsSinkTest.cpp
 
 monitor_count_test_SOURCES = MonitorCountTest.cpp
 
@@ -428,6 +474,12 @@ partial_pass_test_SOURCES = PartialPassTest.cpp
 
 peephole_test_SOURCES = PeepholeTest.cpp
 
+position_interning_test_SOURCES = PositionInterningTest.cpp
+
+position_map_reader_test_SOURCES = PositionMapReaderTest.cpp \
+	$(top_srcdir)/tools/debug-info/PositionMap.cpp
+position_map_reader_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/tools/debug-info
+
 print_kotlin_stats_test_SOURCES = PrintKotlinStatsTest.cpp
 
 proguard_lexer_test_SOURCES = ProguardLexerTest.cpp
@@ -440,12 +492,17 @@ proguard_matcher_test_SOURCES = ProguardMatcherTest.cpp
 proguard_parser_test_SOURCES = ProguardParserTest.cpp
 proguard_parser_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
+proguard_print_configuration_test_SOURCES = ProguardPrintConfigurationTest.cpp
+
 proguard_regex_test_SOURCES = ProguardRegexTest.cpp
 
 pure_analysis_test_SOURCES = PureAnalysisTest.cpp
 pure_analysis_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 random_forest_test_SOURCES = RandomForestTest.cpp
+
+reachable_natives_test_SOURCES = ReachableNativesTest.cpp
+reachable_natives_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 reaching_definitions_test_SOURCES = ReachingDefinitionsTest.cpp
 
@@ -460,6 +517,8 @@ reduce_boolean_branches_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 reduce_gotos_test_SOURCES = ReduceGotosTest.cpp
 reduce_gotos_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
+reduced_cfg_closure_adapter_test_SOURCES = ReducedCFGClosureAdapterTest.cpp
+
 reduce_sparse_switches_test_SOURCES = ReduceSparseSwitchesTest.cpp
 
 reflection_analysis_test_SOURCES = ReflectionAnalysisTest.cpp
@@ -469,6 +528,8 @@ reg_alloc_test_SOURCES = RegAllocTest.cpp OpcodeList.cpp
 reg_alloc_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 registers_test_SOURCES = RegistersTest.cpp OpcodeList.cpp
+
+remark_test_SOURCES = RemarkTest.cpp
 
 remove_null_check_string_arg_test_SOURCES = RemoveNullCheckStringArgTest.cpp ScopeHelper.cpp
 
@@ -505,11 +566,15 @@ compact_pointer_vector_test_SOURCES = CompactPointerVectorTest.cpp
 
 source_blocks_test_SOURCES = SourceBlocksTest.cpp
 
+synthetic_block_counts_test_SOURCES = SyntheticBlockCountsTest.cpp
+
 split_huge_switch_test_SOURCES = SplitHugeSwitchTest.cpp
 
 static_field_dependency_graph_test_SOURCES = StaticFieldDependencyGraphTest.cpp
 
 static_relo_v2_test_SOURCES = StaticReloV2Test.cpp
+
+stringbuilder_append_chain_test_SOURCES = constant-propagation/StringBuilderAppendChainTest.cpp
 
 stringbuilder_outline_test_SOURCES = StringBuilderOutlinerTest.cpp
 
@@ -518,6 +583,12 @@ string_propagation_test_SOURCES = constant-propagation/StringPropagationTest.cpp
 strip_debug_info_test_SOURCES = StripDebugInfoTest.cpp
 
 switch_dispatch_test_SOURCES = SwitchDispatchTest.cpp
+
+string_switch_test_SOURCES = StringSwitchFinderTest.cpp
+string_switch_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+string_switch_transform_test_SOURCES = StringSwitchTransformTest.cpp
+string_switch_transform_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 switch_equiv_test_SOURCES = SwitchEquivFinderTest.cpp
 switch_equiv_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -560,6 +631,12 @@ virt_scope_test_SOURCES = VirtScopeTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
 virt_scope_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 virtual_merging_test_SOURCES = VirtualMergingTest.cpp
+
+virtual_scopes_differential_test_SOURCES = VirtualScopesDifferentialTest.cpp ScopeHelper.cpp
+virtual_scopes_differential_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+virtual_scopes_test_SOURCES = VirtualScopesTest.cpp ScopeHelper.cpp
+virtual_scopes_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 walkers_test_SOURCES = WalkersTest.cpp
 walkers_test_LDADD = $(COMMON_MOCK_TEST_LIBS)

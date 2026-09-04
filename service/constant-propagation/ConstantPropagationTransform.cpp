@@ -7,10 +7,12 @@
 
 #include "ConstantPropagationTransform.h"
 
+#include <algorithm>
 #include <optional>
 #include <unordered_set>
 #include <vector>
 
+#include "Debug.h"
 #include "IRCode.h"
 #include "Match.h"
 #include "ReachableClasses.h"
@@ -118,6 +120,18 @@ struct Transform::Context {
   ClassLiteralMethodsReplacerContext clmr;
 };
 
+// Whether the check-cast `primary`, whose result holds `value`, may throw
+// ClassCastException.
+static bool is_possibly_throwing_check_cast(const IRInstruction* primary,
+                                            const ConstantValue& value) {
+  if (!opcode::is_check_cast(primary->opcode()) || value.is_zero()) {
+    return false;
+  }
+  const DexType* src_type = get_object_constant_type(value);
+  return src_type == nullptr ||
+         !type::check_cast(src_type, primary->get_type());
+}
+
 /*
  * Replace an instruction that has a single destination register with a `const`
  * load. `env` holds the state of the registers after `insn` has been
@@ -137,6 +151,12 @@ bool Transform::replace_with_const(const ConstantEnvironment& env,
   }
   if (opcode::is_a_move_result_pseudo(insn->opcode())) {
     auto primary_it = cfg_it.cfg().primary_instruction_of_move_result(cfg_it);
+    // Materializing a constant into a move-result-pseudo's dest replaces -- and
+    // therefore deletes -- the primary instruction. Keep a check-cast that
+    // could throw, since deleting it would drop the exception.
+    if (is_possibly_throwing_check_cast(primary_it->insn, value)) {
+      return false;
+    }
     always_assert(!replacement.empty());
     if (replacement.size() == 1) {
       IROpcode opcode = replacement.front()->opcode();
@@ -184,8 +204,6 @@ void Transform::generate_const_param(const ConstantEnvironment& env,
   ++m_stats.added_param_const;
 }
 
-namespace {
-
 bool is_known_non_null(const ConstantValue& val) {
   if (constant_propagation_transform_internal::
           enable_object_domain_null_check_elim) {
@@ -195,8 +213,6 @@ bool is_known_non_null(const ConstantValue& val) {
   return scd && scd->interval() == sign_domain::Interval::NEZ;
 }
 
-} // namespace
-
 bool Transform::eliminate_redundant_null_check(
     const ConstantEnvironment& env,
     const WholeProgramState& /* unused */,
@@ -205,7 +221,7 @@ bool Transform::eliminate_redundant_null_check(
   switch (insn->opcode()) {
   case OPCODE_INVOKE_STATIC: {
     // Kotlin null check.
-    if (auto index = get_null_check_object_index(insn, m_state)) {
+    if (auto index = get_null_check_object_index(insn, m_null_check_methods)) {
       ++m_stats.null_checks_method_calls;
       if (is_known_non_null(env.get(insn->src(*index)))) {
         m_mutation->remove(cfg_it);
@@ -214,7 +230,8 @@ bool Transform::eliminate_redundant_null_check(
       }
     }
     // Redex null check.
-    if (insn->get_method() == m_state.redex_null_check_assertion()) {
+    if (insn->get_method() ==
+        m_null_check_methods.redex_null_check_assertion()) {
       ++m_stats.null_checks_method_calls;
       if (is_known_non_null(env.get(insn->src(0)))) {
         m_mutation->remove(cfg_it);
@@ -230,14 +247,39 @@ bool Transform::eliminate_redundant_null_check(
   return false;
 }
 
-// Final classes with symmetric equals -- safe to swap areEqual arguments.
+// Membership test for a hardcoded allowlist. Returns true iff T belongs
+// to a set of types whose equals method is symmetric across the whole set. The
+// symmetry nature of these methods isn't tested at runtime.
+//
+// A type T has an equals that is symmetric iff a.equals(b) == b.equals(a) is
+// guaranteed. There are two noticeable traps that can break this symmetry:
+//   1. T must be final. Without finality, a subclass override could break
+//      symmetry -- cf. java.util.Date / java.sql.Timestamp.
+//   2. This must be true even for heterogeneous types, e.g., a
+//      is of a type that is different from that of b.
 bool is_safe_symmetric_equals_type(const DexType* t) {
-  static const std::unordered_set<const DexType*> safe_types = {
-      type::java_lang_Boolean(),   type::java_lang_Byte(),
-      type::java_lang_Character(), type::java_lang_Class(),
-      type::java_lang_Integer(),   type::java_lang_Long(),
-      type::java_lang_Short(),     type::java_lang_String(),
-  };
+  static const std::unordered_set<const DexType*> safe_types = []() {
+    std::unordered_set<const DexType*> s = {
+        type::java_lang_Boolean(),   type::java_lang_Byte(),
+        type::java_lang_Character(), type::java_lang_Class(),
+        type::java_lang_Integer(),   type::java_lang_Long(),
+        type::java_lang_Short(),     type::java_lang_String(),
+    };
+    // Framework / stdlib types only added if present in the dex.
+    using namespace std::string_view_literals;
+    for (std::string_view desc : {
+             "Landroid/graphics/Bitmap;"sv,
+             "Landroid/graphics/Rect;"sv,
+             "Landroid/os/Bundle;"sv,
+             "Landroid/os/Looper;"sv,
+             "Ljava/util/UUID;"sv,
+         }) {
+      if (auto* type = DexType::get_type(desc)) {
+        s.insert(type);
+      }
+    }
+    return s;
+  }();
   always_assert(!safe_types.contains(nullptr));
   return safe_types.contains(t);
 }
@@ -1404,6 +1446,40 @@ void Transform::forward_targets(
     if (new_target == nullptr) {
       continue;
     }
+    // Computed BEFORE the retarget below: afterwards `block` is no longer a
+    // predecessor of the first skipped target and its share of that block's
+    // inflow is unrecoverable.
+    //
+    // `unconditional_targets.front()` is the block currently on this edge (it
+    // is seeded from `succ_edge->target()`), so it is the only one that
+    // actually loses a predecessor. The rest of the chain keeps its
+    // predecessors -- but each link is the sole FEASIBLE successor of the one
+    // before it, so all of the flow lost at the head propagates unchanged down
+    // the chain. Shed the same ABSOLUTE amount from each, not the same
+    // fraction: a later block with additional predecessors loses the same
+    // executions but a smaller share of its own count.
+    //
+    // Estimate, not exact: `share_of` divides `block`'s outflow by the target's
+    // predecessor total, and `block` may send only part of its flow here, so
+    // this can over-shed. It cannot go negative -- shares are clamped to [0,1].
+    const bool preserve_counts = g_redex->preserve_count_integrity;
+    std::vector<double> departed_abs;
+    if (preserve_counts && !unconditional_targets.empty()) {
+      auto* head = unconditional_targets.front().target;
+      auto* head_sb = source_blocks::get_first_source_block(head);
+      const size_t n_slots = head_sb != nullptr ? head_sb->vals_size : 0;
+      const auto pred_total =
+          source_blocks::apportion::predecessor_totals(head, n_slots);
+      departed_abs.reserve(n_slots);
+      for (size_t i = 0; i < n_slots; ++i) {
+        const double share =
+            source_blocks::apportion::share_of(pred_total, block, i);
+        // A negative share means no count evidence for this slot: shed nothing.
+        departed_abs.push_back(
+            share < 0.0 ? 0.0 : head_sb->get_val(i).value_or(0.0f) * share);
+      }
+    }
+
     // Found (last) successor where no assigned reg is live -- forward to
     // there
     cfg.set_edge_target(succ_edge, new_target);
@@ -1428,7 +1504,24 @@ void Transform::forward_targets(
           break;
         }
         if (source_blocks::has_source_blocks(target)) {
-          source_blocks::scale_source_blocks(target);
+          if (preserve_counts) {
+            // Re-express the absolute departed flow as this block's own
+            // fraction, so every SourceBlock in it -- they annotate the same
+            // program point -- is scaled consistently.
+            auto* t_sb = source_blocks::get_first_source_block(target);
+            std::vector<double> leaving;
+            leaving.reserve(departed_abs.size());
+            size_t slot = 0;
+            for (const double departed : departed_abs) {
+              const double v =
+                  t_sb != nullptr ? t_sb->get_val(slot).value_or(0.0f) : 0.0;
+              leaving.push_back(v > 0.0 ? std::min(1.0, departed / v) : 0.0);
+              ++slot;
+            }
+            source_blocks::apportion::shrink_by_departed(target, leaving);
+          } else {
+            source_blocks::scale_source_blocks(target);
+          }
         }
       }
     }

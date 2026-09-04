@@ -81,15 +81,17 @@
 #include <cinttypes>
 
 #include <boost/format.hpp> // NOLINT
-#include <boost/pending/disjoint_sets.hpp>
-#include <boost/property_map/property_map.hpp>
 
 #include "CFGMutation.h"
 #include "CallSiteSummaries.h"
+#include "CallSiteSummaryReductions.h"
 #include "ConfigFiles.h"
+#include "ControlFlow.h"
 #include "Creators.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexUtil.h"
+#include "IRCode.h"
 #include "InitClassesWithSideEffects.h"
 #include "LiveRange.h"
 #include "MethodProfiles.h"
@@ -101,6 +103,7 @@
 #include "Show.h"
 #include "Shrinker.h"
 #include "SourceBlocks.h"
+#include "SourceBlocksUtils.h"
 #include "Trace.h"
 #include "Walkers.h"
 
@@ -258,12 +261,8 @@ using CalleeCallerClasses =
 // instructions we should exclude, and how many classes calls are distributed
 // over.
 void gather_caller_callees(
-    const ProfileGuidanceConfig& profile_guidance_config,
+    const OutlineabilityContext& outlineability,
     const Scope& scope,
-    const UnorderedSet<size_t>& throughput_interaction_indices,
-    const UnorderedSet<DexMethod*>& throughput_methods,
-    const UnorderedSet<DexMethod*>& sufficiently_warm_methods,
-    const UnorderedSet<DexMethod*>& sufficiently_hot_methods,
     const GetCalleeFunction& get_callee_fn,
     ConcurrentMethodToMethodOccurrences* callee_caller,
     ConcurrentMethodToMethodOccurrences* caller_callee,
@@ -277,17 +276,13 @@ void gather_caller_callees(
       return;
     }
     always_assert(code.cfg_built());
-    CanOutlineBlockDecider block_decider(
-        profile_guidance_config, throughput_interaction_indices,
-        throughput_methods.count(caller) != 0u,
-        sufficiently_warm_methods.count(caller) != 0u,
-        sufficiently_hot_methods.count(caller) != 0u);
     MoveAwareChains move_aware_chains(code.cfg());
     const auto use_def_chains = move_aware_chains.get_use_def_chains();
     const auto def_use_chains = move_aware_chains.get_def_use_chains();
     for (auto& big_block : big_blocks::get_big_blocks(code.cfg())) {
-      auto can_outline = block_decider.can_outline_from_big_block(big_block) ==
-                         CanOutlineBlockDecider::Result::CanOutline;
+      auto can_outline =
+          outlineability.can_outline_from_big_block(caller, big_block) ==
+          OutlineabilityContext::Result::CanOutline;
       for (auto& mie : big_blocks::InstructionIterable(big_block)) {
         auto* insn = mie.insn;
         auto* callee = get_callee_fn(caller, insn);
@@ -395,18 +390,11 @@ class CalleeInvocationSelector {
   param_index_t m_src_regs;
   bool m_needs_range;
 
-  // When we are going to merge different call-site summaries after simplifying,
-  // we need to efficiently track what all the underlying call-site summaries
-  // were. We do that via a "disjoint_sets" data structure what all the
-  // underlying call-site summaries are.
-  using Rank = UnorderedMap<const CallSiteSummary*, size_t>;
-  using Parent = UnorderedMap<const CallSiteSummary*, const CallSiteSummary*>;
-  using RankPMap = boost::associative_property_map<Rank>;
-  using ParentPMap = boost::associative_property_map<Parent>;
-  using CallSiteSummarySets = boost::disjoint_sets<RankPMap, ParentPMap>;
-  Rank m_rank;
-  Parent m_parent;
-  CallSiteSummarySets m_css_sets;
+  // When we merge different call-site summaries after simplifying, we need to
+  // track which weaker summary each one got folded into, so that we can later
+  // serve each invoke with a helper method that binds constants the invoke
+  // actually passes.
+  partial_application::CallSiteSummaryReductions m_reductions;
 
   CallSiteSummarySet m_call_site_summaries;
   using ArgumentCosts = UnorderedMap<src_index_t, int32_t>;
@@ -564,7 +552,6 @@ class CalleeInvocationSelector {
         m_callee(callee),
         m_arg_exclusivity(arg_exclusivity),
         m_callee_caller_classes(callee_caller_classes),
-        m_css_sets((RankPMap(m_rank)), (ParentPMap(m_parent))),
         m_cost_config(cost_config) {
     const auto* callee_call_site_invokes =
         call_site_summarizer.get_callee_call_site_invokes(callee);
@@ -609,7 +596,6 @@ class CalleeInvocationSelector {
     }
 
     // For each call-site summary,
-    // - initialize disjoint set singleton, and
     // - compute current constant argument costs that could potentially be saved
     //   when introducing partial-application helper method, and
     // - keep track of which constant value for which parameter is involved in
@@ -619,7 +605,6 @@ class CalleeInvocationSelector {
       const auto* css = p.first;
       auto& aaem = p.second;
       m_call_site_summaries.insert(css);
-      m_css_sets.make_set(css);
       auto& ac = m_call_site_summary_argument_costs[css];
       const auto& bindings = css->arguments.bindings();
       for (const auto& q : bindings) {
@@ -700,10 +685,8 @@ class CalleeInvocationSelector {
         }
         ac_it->second.erase(src_idx);
         m_pq.insert(reduced_css, make_priority(reduced_css));
-        if (m_call_site_summaries.insert(reduced_css).second) {
-          m_css_sets.make_set(reduced_css);
-        }
-        m_css_sets.union_set(css, reduced_css);
+        m_call_site_summaries.insert(reduced_css);
+        m_reductions.add(css, reduced_css);
         TRACE(PA, 4,
               "[PartialApplication] Merging %s(%s ===> %s) with least cost "
               "%u@%u: net savings %d",
@@ -724,33 +707,34 @@ class CalleeInvocationSelector {
   // expected savings.
   void select_invokes(std::atomic<size_t>* total_estimated_savings,
                       InvokeCallSiteSummaries* selected_invokes) {
-    size_t partial_application_methods{0};
-    UnorderedMap<const CallSiteSummary*, const CallSiteSummary*>
-        selected_css_sets;
-    uint32_t callee_estimated_savings = 0;
+    UnorderedMap<const CallSiteSummary*, int32_t> selected_net_savings;
     while (!m_pq.empty()) {
       const auto* css = m_pq.front();
       auto net_savings = get_net_savings(css);
       m_pq.erase(css);
-      selected_css_sets.emplace(m_css_sets.find_set(css), css);
-      callee_estimated_savings += net_savings;
-      partial_application_methods++;
+      always_assert(net_savings > 0);
+      selected_net_savings.emplace(css, net_savings);
       TRACE(PA, 3, "[PartialApplication] Selected %s(%s) with net savings %d",
             SHOW(m_callee), css->get_key().c_str(), net_savings);
-      always_assert(net_savings > 0);
     }
+    auto is_selected = [&selected_net_savings](const CallSiteSummary* css) {
+      return selected_net_savings.count(css) != 0u;
+    };
+
+    UnorderedSet<const CallSiteSummary*> used_csses;
 
     for (auto& p : m_call_site_invoke_summaries) {
       const auto* invoke_insn = p.first;
       const auto* css = p.second;
-      if (m_call_site_summaries.count(css) == 0u) {
+      // Follow the chain of reductions to the strongest selected summary that
+      // this invoke's own constant arguments still satisfy.
+      const auto* reduced_css = m_reductions.find_selected(css, is_selected);
+      if (reduced_css == nullptr) {
         continue;
       }
-      auto it = selected_css_sets.find(m_css_sets.find_set(css));
-      if (it == selected_css_sets.end()) {
-        continue;
-      }
-      const auto* reduced_css = it->second;
+      always_assert_log(partial_application::is_reduction_of(reduced_css, css),
+                        "%s(%s) is not a reduction of %s", SHOW(m_callee),
+                        reduced_css->get_key().c_str(), css->get_key().c_str());
       // This invoke got selected because including it together with all
       // other invokes with the same css was beneficial on average. Check
       // (and filter out) if it's not actually beneficial for this particular
@@ -762,15 +746,22 @@ class CalleeInvocationSelector {
           }) == aev.end()) {
         continue;
       }
+      used_csses.insert(reduced_css);
       selected_invokes->emplace(invoke_insn, reduced_css);
     }
 
+    // Only summaries that actually ended up serving an invoke will cause a
+    // helper method to be created, so only those contribute savings.
+    uint32_t callee_estimated_savings = 0;
+    for (const auto* css : UnorderedIterable(used_csses)) {
+      callee_estimated_savings += selected_net_savings.at(css);
+    }
     if (callee_estimated_savings > 0) {
       TRACE(PA, 2,
             "[PartialApplication] Selected %s(...) for %zu constant argument "
             "combinations across %zu invokes with net savings %u",
-            SHOW(m_callee), partial_application_methods,
-            selected_invokes->size(), callee_estimated_savings);
+            SHOW(m_callee), used_csses.size(), selected_invokes->size(),
+            callee_estimated_savings);
       *total_estimated_savings += callee_estimated_savings;
     }
   }
@@ -922,6 +913,11 @@ IROpcode get_invoke_opcode(const DexMethod* callee) {
 }
 
 using PaCallers = ConcurrentMap<DexMethodRef*, std::vector<DexMethod*>>;
+// Per helper method, a copy of the source block covering each call-site it will
+// serve. These are copies rather than pointers because `shrink_method` below
+// may free the blocks they live in.
+using PaCallSiteSourceBlocks =
+    ConcurrentMap<DexMethodRef*, std::vector<SourceBlock>>;
 
 // Given the analysis results, rewrite all callers to invoke the new helper
 // methods with bound arguments.
@@ -934,7 +930,8 @@ void rewrite_callers(
     const UnorderedSet<DexMethod*>& selected_callers,
     PaMethodRefs& pa_method_refs,
     std::atomic<size_t>* removed_args,
-    PaCallers* pa_callers) {
+    PaCallers* pa_callers,
+    PaCallSiteSourceBlocks* pa_call_site_source_blocks) {
   Timer t("rewrite_callers");
 
   auto make_partial_application_invoke_insn =
@@ -987,12 +984,35 @@ void rewrite_callers(
       if (!move_result_it.is_end()) {
         new_insns.push_back(new IRInstruction(*move_result_it->insn));
       }
-      mutation.replace(it, new_insns);
       auto* pa = new_invoke_insn->get_method();
       if (pas.insert(pa).second) {
         pa_callers->update(
             pa, [caller](auto*, auto& vec, bool) { vec.push_back(caller); });
       }
+      // Remember how hot this particular call-site is, so that the helper
+      // method can be given a matching source block. The block covering the
+      // call-site is a much better estimate than the caller's entry block: a
+      // hot method may well reach this callee only from a cold path. Unlike
+      // pa_callers, this is deliberately not deduplicated per caller: the
+      // helper runs once per call-site execution, so every call-site
+      // contributes its own count.
+      if (pa_call_site_source_blocks != nullptr) {
+        auto* call_site_sb = source_blocks::get_last_source_block_before(
+            it.block(), it.unwrap());
+        if (call_site_sb != nullptr) {
+          // Copy outside the update callback, which holds a lock. Dropping the
+          // chain first keeps that copy to a single source block; the chain is
+          // irrelevant here, as the synthetic clone drops it anyway.
+          SourceBlock sb_copy(*call_site_sb);
+          sb_copy.next.reset();
+          pa_call_site_source_blocks->update(
+              pa,
+              [&sb_copy](auto*, auto& vec, bool) { vec.push_back(sb_copy); });
+        }
+      }
+      // Scheduled last: the source-block read above must see the block as it
+      // is now, rather than relying on CFGMutation deferring its edits.
+      mutation.replace(it, new_insns);
       any_changes = true;
     }
     mutation.flush();
@@ -1060,8 +1080,10 @@ void push_callee_arg(EnumUtilsCache& enum_utils_cache,
 }
 
 // Create all new helper methods that bind constant arguments
-void create_partial_application_methods(EnumUtilsCache& enum_utils_cache,
-                                        PaMethodRefs& pa_method_refs) {
+void create_partial_application_methods(
+    EnumUtilsCache& enum_utils_cache,
+    PaMethodRefs& pa_method_refs,
+    PaCallSiteSourceBlocks& pa_call_site_source_blocks) {
   Timer t("create_partial_application_methods");
   std::map<DexMethodRef*, const CalleeCallSiteSummary*, dexmethods_comparator>
       inverse_ordered_pa_method_refs;
@@ -1118,6 +1140,27 @@ void create_partial_application_methods(EnumUtilsCache& enum_utils_cache,
     }
     pa_method->set_deobfuscated_name(show_deobfuscated(pa_method));
     pa_method->get_code()->build_cfg();
+    // The helper method is only ever reached from the call-sites we rewrote, so
+    // derive its hotness from theirs. Without source blocks, later passes and
+    // profile-guided layout would have no hotness information at all for these
+    // methods, even though they sit on the path of every call-site they serve.
+    // Empty unless the fix is enabled, in which case rewrite_callers gathered
+    // a source block per call-site this helper serves.
+    auto* call_site_sbs = pa_call_site_source_blocks.get_unsafe(pa_method_ref);
+    if (call_site_sbs != nullptr && !call_site_sbs->empty()) {
+      std::vector<SourceBlock*> sbs;
+      sbs.reserve(call_site_sbs->size());
+      for (auto& sb : *call_site_sbs) {
+        sbs.push_back(&sb);
+      }
+      source_blocks::insert_synthetic_source_blocks_in_method(
+          pa_method, [pa_method, &sbs]() {
+            // N:1: the helper method is reached from every call-site it serves,
+            // so its count is about the SUM of theirs, not the max.
+            return source_blocks::clone_as_synthetic_summing(sbs.front(),
+                                                             pa_method, sbs);
+          });
+    }
     cls->add_method(pa_method);
     TRACE(PA, 5, "[PartialApplication] Created %s binding %s:\n%s",
           SHOW(pa_method), css->get_key().c_str(),
@@ -1184,6 +1227,14 @@ void PartialApplicationPass::bind_config() {
        pg.method_profiles_warm_call_count,
        pg.method_profiles_warm_call_count,
        "Loops are not outlined from warm methods");
+  bind("fix_missing_source_blocks",
+       m_fix_missing_source_blocks,
+       m_fix_missing_source_blocks,
+       "Whether to fix up generated helper methods to have source blocks, "
+       "derived from the call-sites they serve. Off by default, as it makes "
+       "the helpers visible to profile-guided decisions such as inlining, "
+       "which can move size and performance. TODO: Remove this option, and "
+       "always fix up the source blocks, once the impact has been assessed");
   bind("derive_method_profiles_stats",
        m_derive_method_profiles_stats,
        m_derive_method_profiles_stats,
@@ -1286,11 +1337,12 @@ void PartialApplicationPass::run_pass(DexStoresVector& stores,
   ConcurrentMethodToMethodOccurrences caller_callee;
   InsnsArgExclusivity arg_exclusivity;
   CalleeCallerClasses callee_caller_classes;
-  gather_caller_callees(
-      m_profile_guidance_config, scope, throughput_interaction_indices,
-      throughput_methods, sufficiently_warm_methods, sufficiently_hot_methods,
-      get_callee_fn, &callee_caller, &caller_callee, &arg_exclusivity,
-      &excluded_invoke_insns, &callee_caller_classes);
+  const OutlineabilityContext outlineability(
+      m_profile_guidance_config, throughput_interaction_indices,
+      throughput_methods, sufficiently_warm_methods, sufficiently_hot_methods);
+  gather_caller_callees(outlineability, scope, get_callee_fn, &callee_caller,
+                        &caller_callee, &arg_exclusivity,
+                        &excluded_invoke_insns, &callee_caller_classes);
 
   TRACE(PA, 1, "[PartialApplication] %zu callers, %zu callees",
         caller_callee.size(), callee_caller.size());
@@ -1325,10 +1377,14 @@ void PartialApplicationPass::run_pass(DexStoresVector& stores,
 
   std::atomic<size_t> removed_args{0};
   PaCallers pa_callers;
+  PaCallSiteSourceBlocks pa_call_site_source_blocks;
   rewrite_callers(scope, shrinker, get_callee_fn, selected_invokes,
-                  selected_callers, pa_method_refs, &removed_args, &pa_callers);
+                  selected_callers, pa_method_refs, &removed_args, &pa_callers,
+                  m_fix_missing_source_blocks ? &pa_call_site_source_blocks
+                                              : nullptr);
 
-  create_partial_application_methods(enum_utils_cache, pa_method_refs);
+  create_partial_application_methods(enum_utils_cache, pa_method_refs,
+                                     pa_call_site_source_blocks);
 
   if (m_derive_method_profiles_stats) {
     size_t derived_method_profile_stats =

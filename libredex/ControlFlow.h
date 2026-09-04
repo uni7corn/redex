@@ -56,6 +56,15 @@
  * and MFLOW_CATCHes are deleted and their information is moved to the edges of
  * the CFG.
  *
+ * Source-block folding: once gotos become edges, a block whose only real
+ * content was a bare goto becomes instruction-empty and is folded into an edge
+ * by simplify()/remove_empty_blocks() (run from build_cfg and from post-pass
+ * cleanups). Its source blocks are carried into the successor only when the
+ * successor has a single predecessor (or, under instrument_mode, the whole
+ * block is kept). Otherwise the source blocks are dropped, so any source block
+ * you need to survive must live on a block that also contains a real
+ * instruction.
+ *
  * TODO: Add useful CFG editing methods
  * TODO: phase out edits to the IRCode and move them all to the CFG
  * TODO: remove non-CFG option
@@ -430,6 +439,10 @@ class Block final {
   void insert_after(const IRList::iterator& it,
                     std::unique_ptr<SourceBlock> sb);
 
+  void insert_before(const IRList::iterator& it,
+                     std::unique_ptr<Remark> remark);
+  void insert_after(const IRList::iterator& it, std::unique_ptr<Remark> remark);
+
   bool structural_equals(const Block* other) const;
   bool structural_equals(const Block* other,
                          const InstructionEquality& instruction_equals) const;
@@ -517,6 +530,12 @@ class ControlFlowGraph {
   // blocks in the sorted output.
   std::vector<Block*> blocks_reverse_post_deprecated() const;
 
+  // Invariant: an *empty* block (no instructions) may have at most one
+  // successor edge — `remove_empty_blocks` asserts `succs.size() == 1`
+  // ("too many successors for empty block"). So when a freshly created
+  // block needs multiple successors (a conditional or switch), it must
+  // carry the governing branch instruction: build it with
+  // `create_branch` rather than `create_block` + multiple `add_edge`s.
   Block* create_block();
 
   // Create a new block (with a unique ID) that has a copy of the code inside
@@ -525,6 +544,17 @@ class ControlFlowGraph {
   Block* duplicate_block(Block* original);
 
   Block* entry_block() const { return m_entry_block; }
+  // The exit block is NOT computed upon CFG creation; this returns
+  // nullptr until `calculate_exit_block()` (below) has been called.
+  // Many post-dominator-consuming analyses require it; if you forget
+  // to call `calculate_exit_block()`, your post-dominator query path
+  // will see nullptr as the root and produce garbage or crash.
+  //
+  // When the method has a SINGLE return point, the returned block IS
+  // the real block containing that return — NOT a synthetic "ghost"
+  // node. Only when there are MULTIPLE return points does
+  // `calculate_exit_block()` synthesize a ghost successor. Don't assume
+  // "exit block == ghost" universally.
   Block* exit_block() const { return m_exit_block; }
   void set_entry_block(Block* b) { m_entry_block = b; }
   void set_exit_block(Block* b) { m_exit_block = b; }
@@ -755,6 +785,11 @@ class ControlFlowGraph {
   void insert_after(const InstructionIterator& it,
                     std::unique_ptr<SourceBlock> sb);
 
+  void insert_before(const InstructionIterator& it,
+                     std::unique_ptr<Remark> remark);
+  void insert_after(const InstructionIterator& it,
+                    std::unique_ptr<Remark> remark);
+
   // Insertion Methods (insert_before/after and push_front/back):
   //  * These methods add instructions to the CFG
   //  * They do not add branch (if-*, switch-*) instructions to the cfg (use
@@ -780,10 +815,12 @@ class ControlFlowGraph {
   // * IRInstruction*
   // * std::unique_ptr<SourceBlock>
   // * std::unique_ptr<DexPosition>
+  // * std::unique_ptr<Remark>
   // * InsertVariant, std::variant of the previous types
   using InsertVariant = std::variant<IRInstruction*,
                                      std::unique_ptr<SourceBlock>,
-                                     std::unique_ptr<DexPosition>>;
+                                     std::unique_ptr<DexPosition>,
+                                     std::unique_ptr<Remark>>;
 
   template <class ForwardIt>
   bool insert_before(const InstructionIterator& position,
@@ -948,6 +985,13 @@ class ControlFlowGraph {
 
   reg_t get_registers_size() const { return m_registers_size; }
 
+  // A freshly-constructed ControlFlowGraph starts with m_registers_size == 0;
+  // it is NOT inferred from the instructions you add. If you build a CFG and
+  // push instructions referencing registers vN, you MUST set the size to cover
+  // them (e.g. copy the source CFG's `get_registers_size()`). A size smaller
+  // than a referenced register is only caught by `sanity_check` when the code
+  // is lowered to dex (e.g. through PassManager) -- NOT during in-memory IR
+  // construction, so unit tests that never lower will silently pass.
   void set_registers_size(reg_t sz) { m_registers_size = sz; }
 
   // Find the highest register in use and set m_registers_size
@@ -996,6 +1040,18 @@ class ControlFlowGraph {
    * clear and fill `new_cfg` with a copy of `this`. Copies of all instructions
    * will be made, and are owned by the caller. Consider calling
    * set_insn_ownership on the new cfg to have it own the instructions.
+   *
+   * NOTE: this copies ALL blocks and ALL edges verbatim -- including a block's
+   * outgoing edges to blocks you may intend to exclude (e.g. when extracting a
+   * sub-region, the region-exit edges to the continuation). A bare deep_copy
+   * does NOT trim anything: callers extracting a subset must afterward remove
+   * the out-of-region blocks and re-point or synthesize the boundary edges,
+   * otherwise the excluded continuation remains reachable and executes inside
+   * the copy. The source's register width carries over: `registers_size` is
+   * copied verbatim (a stored field, not re-inferred from the copied
+   * instructions), so the new cfg is immediately well-formed -- you need NOT
+   * call set_registers_size after a deep_copy. That setter is only for cfgs
+   * built by other means (see set_registers_size below).
    */
   void deep_copy(ControlFlowGraph* new_cfg) const;
 
@@ -1124,7 +1180,11 @@ class ControlFlowGraph {
   // Used while turning back into a linear representation.
   void insert_try_catch_markers(const std::vector<Block*>& ordering);
 
-  // remove blocks with no entries
+  // Remove instruction-empty blocks by folding each into its single successor.
+  // Source blocks on a folded block are moved into the successor only when the
+  // successor has a single predecessor (or the whole block is kept under
+  // instrument_mode); otherwise they are dropped. Positions are preserved via
+  // fix_dangling_parents.
   void remove_empty_blocks();
 
   // Re-insert any parent pointer that got deleted. This is a useful
@@ -1577,9 +1637,13 @@ bool ControlFlowGraph::insert(const InstructionIterator& position,
 
   // We might need to propagate source blocks if we create a block.
   // Find the latest source block in the current block in case.
+  // NOTE: when `pos` is `b->end()` we must not dereference it; treat that
+  // case as "no matching position MIE in this block" and scan the entire
+  // block for the latest source block.
+  const bool pos_is_end = (pos == b->end());
   SourceBlock* last_src_block = nullptr;
   for (const auto& mie : *b) {
-    if (mie.pos == pos->pos) {
+    if (!pos_is_end && mie.pos == pos->pos) {
       break;
     }
     if (mie.type == MFLOW_SOURCE_BLOCK) {
@@ -1620,9 +1684,7 @@ bool ControlFlowGraph::insert(const InstructionIterator& position,
           // throwing instruction.
           auto existing_last_op = existing_last->insn->opcode();
           always_assert_log(
-              !opcode::is_branch(existing_last_op) &&
-                  !opcode::is_throw(existing_last_op) &&
-                  !opcode::is_a_return(existing_last_op),
+              !opcode::is_terminal(existing_last_op),
               "Can't add instructions after %s in Block %zu in %s",
               details::show_insn(existing_last->insn).c_str(), b->id(),
               details::show_cfg(*this).c_str());
@@ -1756,6 +1818,10 @@ bool ControlFlowGraph::insert(const InstructionIterator& position,
       }
       b->m_entries.insert_before(
           pos, std::get<std::unique_ptr<DexPosition>>(std::move(v)));
+    } else if (std::holds_alternative<std::unique_ptr<Remark>>(v)) {
+      // Block-anchored metadata; insert in place, no cross-split propagation.
+      b->m_entries.insert_before(
+          pos, std::get<std::unique_ptr<Remark>>(std::move(v)));
     } else {
       not_reached();
     }

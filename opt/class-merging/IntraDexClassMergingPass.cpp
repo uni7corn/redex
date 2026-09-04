@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "Debug.h"
 #include "Model.h"
 
 #include "ClassMerging.h"
@@ -135,15 +136,17 @@ void IntraDexClassMergingPass::run_pass(DexStoresVector& stores,
     return;
   }
 
+  virtual_scope::VirtualScopes vscopes(scope);
+
   auto& root_store = stores.at(0);
   auto& root_dexen = root_store.get_dexen();
   if (m_enable_reshuffle && interdex_pass->minimize_cross_dex_refs() &&
       root_dexen.size() > 1) {
     if (m_enable_mergeability_aware_reshuffle) {
       class_merging::Model merging_model =
-          class_merging::construct_global_model(type_system, scope, mgr, conf,
-                                                stores, m_merging_spec,
-                                                m_global_min_count);
+          class_merging::construct_global_model(
+              type_system, vscopes, scope, mgr, conf, stores, m_merging_spec,
+              m_global_min_count);
       InterDexReshuffleImpl impl(
           conf, mgr, m_reshuffle_config, scope, root_dexen,
           interdex_pass->get_dynamically_dead_dexes(), &merging_model);
@@ -160,10 +163,7 @@ void IntraDexClassMergingPass::run_pass(DexStoresVector& stores,
     UnorderedSet<DexClass*> original_scope_set(scope.begin(), scope.end());
     scope = build_class_scope(stores);
     UnorderedSet<DexClass*> new_scope_set(scope.begin(), scope.end());
-    always_assert(original_scope_set.size() == new_scope_set.size());
-    for (auto* cls : UnorderedIterable(original_scope_set)) {
-      always_assert(new_scope_set.count(cls));
-    }
+    always_assert(unordered_equal(original_scope_set, new_scope_set));
   }
 
   mgr.set_metric("num_spec_merging_targets",
@@ -171,7 +171,7 @@ void IntraDexClassMergingPass::run_pass(DexStoresVector& stores,
   mgr.set_metric("num_spec_excluded_types",
                  m_merging_spec.exclude_types.size());
 
-  class_merging::merge_model(type_system, scope, conf, mgr, stores,
+  class_merging::merge_model(type_system, vscopes, scope, conf, mgr, stores,
                              m_merging_spec, true /* is_intra_dex */);
 
   post_dexen_changes(scope, stores);

@@ -14,7 +14,9 @@
 #include <unistd.h>
 
 #include "ConfigFiles.h"
+#include "GlobalConfig.h"
 #include "RedexTest.h"
+#include "SourceBlocksViolations.h"
 
 class ConfigFilesTest : public RedexTest {
  public:
@@ -223,19 +225,130 @@ TEST_F(ConfigFilesTest, dead_class_list_empty_file) {
   std::remove(path.c_str());
 }
 
-// Relocated class suffix — should go to live_class_split_list, not dead list.
+// A "$relocated" row is filtered out of the dead-class list rather than being
+// treated as a dead class in its own right.
 TEST_F(ConfigFilesTest, dead_class_list_relocated_class) {
   auto path = write_temp_dead_class_file(
       "com.facebook.Alive$relocated\t100\t50\t10\t3\t86400\n"
       "com.facebook.Dead\t200\t0\t0\t8\t172800\n");
   auto conf = make_config_with_dead_class_list(path);
   const auto& dead = conf.get_dead_class_list();
-  const auto& live = conf.get_live_class_split_list();
 
   EXPECT_EQ(dead.size(), 1);
   EXPECT_NE(dead.find("Lcom/facebook/Dead;"), dead.end());
-
-  EXPECT_NE(live.find("Lcom/facebook/Alive;"), live.end());
+  EXPECT_EQ(dead.find("Lcom/facebook/Alive;"), dead.end());
+  EXPECT_EQ(dead.find("Lcom/facebook/Alive$relocated;"), dead.end());
 
   std::remove(path.c_str());
+}
+
+// The defaults have to keep matching the values that were hardcoded in
+// PassManager before they became configurable, or every enabled run silently
+// starts measuring something else.
+TEST_F(ConfigFilesTest, violations_tracking_config_defaults) {
+  Json::Value json_cfg;
+  std::istringstream temp_json("{\"redex\":{\"passes\":[]}}");
+  temp_json >> json_cfg;
+  ConfigFiles conf(json_cfg);
+  conf.parse_global_config();
+
+  const auto* config =
+      conf.get_global_config().get_config_by_name<ViolationsTrackingConfig>(
+          "violations_tracking");
+  ASSERT_NE(config, nullptr);
+  EXPECT_FALSE(config->enabled);
+  EXPECT_EQ(config->violation_kinds, std::vector<std::string>{"ChainAndDom"});
+  EXPECT_EQ(config->top_n, 10u);
+  EXPECT_TRUE(config->methods_to_vis.empty());
+  EXPECT_TRUE(config->source_blocks_to_track.empty());
+  EXPECT_FALSE(config->track_intermethod_violations);
+  EXPECT_FALSE(config->print_all_violations);
+  EXPECT_FALSE(config->ignore_undefined);
+}
+
+TEST_F(ConfigFilesTest, violations_tracking_config_from_json) {
+  Json::Value json_cfg;
+  std::istringstream temp_json(R"({
+    "redex": {"passes": []},
+    "violations_tracking": {
+      "enabled": true,
+      "violation_kinds": ["HotImmediateDomNotHot"],
+      "top_n": 5,
+      "methods_to_vis": ["LFoo;.bar:()V", "LFoo;.baz:()V"],
+      "source_blocks_to_track": ["LFoo;.bar:()V@3"],
+      "track_intermethod_violations": true,
+      "print_all_violations": true,
+      "ignore_undefined": true
+    }
+  })");
+  temp_json >> json_cfg;
+  ConfigFiles conf(json_cfg);
+  conf.parse_global_config();
+
+  const auto* config =
+      conf.get_global_config().get_config_by_name<ViolationsTrackingConfig>(
+          "violations_tracking");
+  ASSERT_NE(config, nullptr);
+  EXPECT_TRUE(config->enabled);
+  EXPECT_EQ(config->violation_kinds,
+            std::vector<std::string>{"HotImmediateDomNotHot"});
+  EXPECT_EQ(config->top_n, 5u);
+  EXPECT_EQ(config->methods_to_vis,
+            (std::vector<std::string>{"LFoo;.bar:()V", "LFoo;.baz:()V"}));
+  EXPECT_EQ(config->source_blocks_to_track,
+            std::vector<std::string>{"LFoo;.bar:()V@3"});
+  EXPECT_TRUE(config->track_intermethod_violations);
+  EXPECT_TRUE(config->print_all_violations);
+  EXPECT_TRUE(config->ignore_undefined);
+}
+
+// Every configured name has to resolve to a violation kind; PassManager aborts
+// on one that does not.
+TEST_F(ConfigFilesTest, violations_tracking_config_kinds_are_parseable) {
+  Json::Value json_cfg;
+  std::istringstream temp_json("{\"redex\":{\"passes\":[]}}");
+  temp_json >> json_cfg;
+  ConfigFiles conf(json_cfg);
+  conf.parse_global_config();
+
+  const auto* config =
+      conf.get_global_config().get_config_by_name<ViolationsTrackingConfig>(
+          "violations_tracking");
+  ASSERT_NE(config, nullptr);
+  for (const auto& name : config->violation_kinds) {
+    EXPECT_TRUE(source_blocks::violation_name_to_enum(name).has_value())
+        << "unparseable default violation kind: " << name;
+  }
+}
+
+// The setting moved out of `pass_manager`. Configurable drops unbound keys
+// silently, so without an explicit check an old config would keep parsing and
+// quietly stop tracking; make sure it says so instead.
+TEST_F(ConfigFilesTest, violations_tracking_old_pass_manager_key_is_rejected) {
+  Json::Value json_cfg;
+  std::istringstream temp_json(
+      R"({"redex": {"passes": []},
+          "pass_manager": {"violations_tracking": true}})");
+  temp_json >> json_cfg;
+  ConfigFiles conf(json_cfg);
+
+  EXPECT_THROW(conf.parse_global_config(), RedexException);
+}
+
+// ...and the key is only rejected when it is actually set, so a config that
+// merely mentions `pass_manager` is unaffected.
+TEST_F(ConfigFilesTest, violations_tracking_unset_old_key_is_fine) {
+  Json::Value json_cfg;
+  std::istringstream temp_json(
+      R"({"redex": {"passes": []},
+          "pass_manager": {"violations_tracking": false, "dump_mrefs": true}})");
+  temp_json >> json_cfg;
+  ConfigFiles conf(json_cfg);
+  conf.parse_global_config();
+
+  const auto* pm_config =
+      conf.get_global_config().get_config_by_name<PassManagerConfig>(
+          "pass_manager");
+  ASSERT_NE(pm_config, nullptr);
+  EXPECT_TRUE(pm_config->dump_mrefs);
 }

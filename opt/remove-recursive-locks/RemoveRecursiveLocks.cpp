@@ -7,6 +7,7 @@
 
 #include "RemoveRecursiveLocks.h"
 
+#include <bit>
 #include <bitset>
 #include <iostream>
 #include <variant>
@@ -18,6 +19,7 @@
 #include "CFGMutation.h"
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexUtil.h"
 #include "IRInstruction.h"
@@ -75,7 +77,7 @@ using LockEnvironment =
 
 size_t clz(LockType val) {
   static_assert(sizeof(val) == 4 || sizeof(val) == 8, "Unsupported type");
-  return sizeof(val) == 4 ? __builtin_clz(val) : __builtin_clzll(val);
+  return std::countl_zero(val);
 }
 
 size_t get_max_depth(LockType val) {
@@ -661,7 +663,7 @@ struct Stats {
   static constexpr size_t kArraySize = analysis::kMaxLockDepth + 1;
   std::array<UnorderedSet<DexMethod*>, kArraySize> counts;
   std::array<UnorderedSet<DexMethod*>, kArraySize> counts_per;
-  size_t all_methods{1};
+  size_t all_methods{0};
   size_t methods_with_locks{0};
   size_t removed{0};
   UnorderedSet<DexMethod*> methods_with_issues;
@@ -677,7 +679,7 @@ struct Stats {
     all_methods += rhs.all_methods;
     methods_with_locks += rhs.methods_with_locks;
     removed += rhs.removed;
-    insert_unordered_iterable(methods_with_issues, methods_with_issues);
+    insert_unordered_iterable(methods_with_issues, rhs.methods_with_issues);
     insert_unordered_iterable(non_singleton_rdefs, rhs.non_singleton_rdefs);
     return *this;
   }
@@ -752,10 +754,15 @@ void run_impl(DexStoresVector& stores,
   Stats stats =
       walk::parallel::methods<Stats>(scope, [](DexMethod* method) -> Stats {
         auto* code = method->get_code();
-        if (code != nullptr && !method->rstate.no_optimizations()) {
-          return run_locks_removal(method, code);
-        }
-        return Stats{};
+        // `Stats{}` is the identity of the walker's reduction, and the walker
+        // default-constructs one per thread, so only the value returned for a
+        // method may carry a count.
+        Stats method_stats =
+            code != nullptr && !method->rstate.no_optimizations()
+                ? run_locks_removal(method, code)
+                : Stats{};
+        method_stats.all_methods = 1;
+        return method_stats;
       });
 
   auto print = [&mgr, &stats_prefix](const std::string& name, size_t stat) {
@@ -793,7 +800,8 @@ void run_impl(DexStoresVector& stores,
   print("all_methods", stats.all_methods);
   print("methods_with_locks", stats.methods_with_locks);
   print("methods_with_issues", stats.methods_with_issues.size());
-  if (!stats.methods_with_issues.empty()) {
+  if ((kDebugPass || traceEnabled(LOCKS, 2)) &&
+      !stats.methods_with_issues.empty()) {
     std::cerr << "Lock analysis failed for:\n";
     for (auto* m : sorted(stats.methods_with_issues)) {
       std::cerr << " * " << show(m) << '\n';

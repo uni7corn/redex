@@ -22,6 +22,7 @@ class IntraDexInlinePass : public Pass {
     using namespace redex_properties::interactions;
     using namespace redex_properties::names;
     return {
+        {NeedsAreEqualRefReservation, Establishes},
         {DexLimitsObeyed, Preserves},
         {NoResolvablePureRefs, Preserves},
         // This may be too conservative as the inliner can be configured not
@@ -43,4 +44,9 @@ class IntraDexInlinePass : public Pass {
 
   HotColdInliningBehavior m_hot_cold_inlining_behavior;
   bool m_partial_hot_hot;
+
+  int m_inline_hot_callsite_count_percentile;
+  float m_inline_hot_callsite_count_discount;
+  int m_inline_hot_callsite_count_top_percentile;
+  float m_inline_hot_callsite_count_top_discount;
 };

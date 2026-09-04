@@ -623,6 +623,18 @@ std::vector<std::unique_ptr<DexDebugInstruction>> generate_debug_instructions(
   return dbgops;
 }
 
+size_t DexDebugItem::max_encoded_size(
+    uint32_t num_params,
+    const std::vector<std::unique_ptr<DexDebugInstruction>>& dbgops) {
+  // line_start + num_params + one uleb128p1 per parameter, then the ops, then
+  // DBG_END_SEQUENCE.
+  size_t size = 2 * kMaxLeb128Size + (size_t)num_params * kMaxLeb128Size + 1;
+  for (const auto& dbgop : dbgops) {
+    size += dbgop->max_encoded_size();
+  }
+  return size;
+}
+
 int DexDebugItem::encode(
     DexOutputIdx* dodx,
     uint8_t* output,
@@ -795,6 +807,29 @@ std::unique_ptr<DexCode> DexCode::get_dex_code(DexIdx* idx, uint32_t offset) {
   }
   dc->m_dbg = DexDebugItem::get_dex_debug(idx, code->debug_info_off);
   return dc;
+}
+
+size_t DexCode::max_encoded_size() const {
+  // The header, then every instruction -- unfiltered, so that DexOpcodeData's
+  // payload (m_data_count + 1 code units) is included exactly as `encode`
+  // writes it.
+  size_t size = sizeof(dex_code_item);
+  for (auto const& opc : get_instructions()) {
+    size += opc->size() * sizeof(uint16_t);
+  }
+  if (m_tries.empty()) {
+    return size;
+  }
+  // The uint16 pad that 4-aligns the tries table, the table itself, then the
+  // handler stream: one uleb128 for the distinct-handler count, and per try a
+  // sleb128 count followed by a type index and an address per catch.
+  size += sizeof(uint16_t);
+  size += m_tries.size() * sizeof(dex_tries_item);
+  size += kMaxLeb128Size;
+  for (auto const& dextry : m_tries) {
+    size += kMaxLeb128Size + dextry->m_catches.size() * 2 * kMaxLeb128Size;
+  }
+  return size;
 }
 
 int DexCode::encode(DexOutputIdx* dodx, uint32_t* output) {
@@ -1285,14 +1320,18 @@ void DexClass::load_class_data_item(
     return;
   }
   const uint8_t* encd = idx->get_uleb_data(cdi_off);
-  always_assert_type_log(encd < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t sfield_count = read_uleb128(&encd);
-  always_assert_type_log(encd < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t ifield_count = read_uleb128(&encd);
-  always_assert_type_log(encd < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t dmethod_count = read_uleb128(&encd);
-  always_assert_type_log(encd < idx->end(), INVALID_DEX, "Dex overflow");
-  uint32_t vmethod_count = read_uleb128(&encd);
+  uint32_t sfield_count = idx->read_uleb128_checked(&encd);
+  uint32_t ifield_count = idx->read_uleb128_checked(&encd);
+  always_assert_type_log(static_cast<uint64_t>(sfield_count) + ifield_count <=
+                             idx->get_field_ids_size(),
+                         INVALID_DEX,
+                         "class_data_item field count exceeds dex field ids");
+  uint32_t dmethod_count = idx->read_uleb128_checked(&encd);
+  uint32_t vmethod_count = idx->read_uleb128_checked(&encd);
+  always_assert_type_log(static_cast<uint64_t>(dmethod_count) + vmethod_count <=
+                             idx->get_method_ids_size(),
+                         INVALID_DEX,
+                         "class_data_item method count exceeds dex method ids");
   uint32_t ndex = 0;
 
   std::vector<std::unique_ptr<DexEncodedValue>> empty{};
@@ -1304,10 +1343,8 @@ void DexClass::load_class_data_item(
 
   m_sfields.reserve(sfield_count);
   for (uint32_t i = 0; i < sfield_count; i++) {
-    always_assert(encd < idx->end());
-    ndex += read_uleb128(&encd);
-    always_assert(encd < idx->end());
-    auto access_flags = (DexAccessFlags)read_uleb128(&encd);
+    ndex += idx->read_uleb128_checked(&encd);
+    auto access_flags = (DexAccessFlags)idx->read_uleb128_checked(&encd);
     always_assert_type_log(is_static(access_flags), INVALID_DEX,
                            "Static field not marked static");
     DexField* df = dynamic_cast<DexField*>(idx->get_fieldidx(ndex));
@@ -1325,10 +1362,8 @@ void DexClass::load_class_data_item(
   ndex = 0;
   m_ifields.reserve(ifield_count);
   for (uint32_t i = 0; i < ifield_count; i++) {
-    always_assert(encd < idx->end());
-    ndex += read_uleb128(&encd);
-    always_assert(encd < idx->end());
-    auto access_flags = (DexAccessFlags)read_uleb128(&encd);
+    ndex += idx->read_uleb128_checked(&encd);
+    auto access_flags = (DexAccessFlags)idx->read_uleb128_checked(&encd);
     always_assert_type_log(!is_static(access_flags), INVALID_DEX,
                            "Non-Static field marked static");
     DexField* df = dynamic_cast<DexField*>(idx->get_fieldidx(ndex));
@@ -1343,12 +1378,9 @@ void DexClass::load_class_data_item(
 
   auto process_method = [this, &encd, &idx, &method_pointer_cache](
                             uint32_t& ndex, bool is_virtual) {
-    always_assert(encd < idx->end());
-    ndex += read_uleb128(&encd);
-    always_assert(encd < idx->end());
-    auto access_flags = (DexAccessFlags)read_uleb128(&encd);
-    always_assert(encd < idx->end());
-    uint32_t code_off = read_uleb128(&encd);
+    ndex += idx->read_uleb128_checked(&encd);
+    auto access_flags = (DexAccessFlags)idx->read_uleb128_checked(&encd);
+    uint32_t code_off = idx->read_uleb128_checked(&encd);
     // Find method in method index, returns same pointer for same method.
     DexMethod* dm = dynamic_cast<DexMethod*>(idx->get_methodidx(ndex));
     always_assert_type_log(dm->get_class() == get_type(), INVALID_DEX,
@@ -1477,6 +1509,12 @@ DexField* DexClass::find_sfield(const char* name,
 bool DexClass::has_class_data() const {
   return !m_vmethods.empty() || !m_dmethods.empty() || !m_ifields.empty() ||
          !m_sfields.empty();
+}
+
+size_t DexClass::max_encoded_size() const {
+  return 4 * kMaxLeb128Size +
+         (m_sfields.size() + m_ifields.size()) * 2 * kMaxLeb128Size +
+         (m_dmethods.size() + m_vmethods.size()) * 3 * kMaxLeb128Size;
 }
 
 int DexClass::encode(DexOutputIdx* dodx,

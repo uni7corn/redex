@@ -205,18 +205,12 @@ class PassManager {
   void disable_checker() { m_checker_disabled = true; }
 
  private:
+  // Owns everything whose lifetime spans a single run_passes() call. Defined in
+  // PassManager.cpp; nested here rather than made file-local because its setup,
+  // per-pass, and teardown steps all reach into PassManager's private state.
+  class RunPassesContext;
+
   void init(const ConfigFiles& config);
-  void check_no_new_dex_features(const DexStoresVector& stores,
-                                 const Pass* pass,
-                                 int check_against_version);
-
-  hashing::DexHash run_hasher(const char* name, const Scope& scope);
-
-  void eval_passes(DexStoresVector&, ConfigFiles&);
-
-  void init_property_interactions(ConfigFiles& conf);
-
-  void check_unreleased_reserved_refs();
 
   AssetManager m_asset_mgr;
   std::vector<Pass*> m_registered_passes;
@@ -228,9 +222,6 @@ class PassManager {
   PassInfo* m_current_pass_info;
 
   std::unique_ptr<const keep_rules::ProguardConfiguration> m_pg_config;
-  std::optional<bool> m_has_dex37_features;
-  std::optional<bool> m_has_dex38_features;
-  std::optional<bool> m_has_dex39_features;
   const RedexOptions m_redex_options;
   bool m_regalloc_has_run{false};
   bool m_nopper_has_run{false};
@@ -239,7 +230,6 @@ class PassManager {
   bool m_interdex_has_run{false};
   bool m_unreliable_virtual_scopes{false};
   ReserveRefsInfoList m_reserved_ref_infos;
-  Pass* m_malloc_profile_pass{nullptr};
 
   std::optional<hashing::DexHash> m_initial_hash;
 

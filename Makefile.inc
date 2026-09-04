@@ -3,7 +3,6 @@
 #
 COMMON_INCLUDES = \
 	-I$(top_srcdir)/analysis/ip-reflection-analysis \
-	-I$(top_srcdir)/analysis/max-depth \
 	-I$(top_srcdir)/checkers \
 	-I$(top_srcdir)/liblocator \
 	-I$(top_srcdir)/libredex \
@@ -15,6 +14,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/analyze-pure-method \
 	-I$(top_srcdir)/opt/app_module_usage \
 	-I$(top_srcdir)/opt/art-profile-writer \
+	-I$(top_srcdir)/opt/atomic-field-updater-lowering \
 	-I$(top_srcdir)/opt/annoclasskill \
 	-I$(top_srcdir)/opt/annokill \
 	-I$(top_srcdir)/opt/basic-block \
@@ -24,7 +24,6 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/check_breadcrumbs \
 	-I$(top_srcdir)/opt/class-merging \
 	-I$(top_srcdir)/opt/class-reordering \
-	-I$(top_srcdir)/opt/class-splitting \
 	-I$(top_srcdir)/opt/clinit-batching \
 	-I$(top_srcdir)/opt/constant-propagation \
 	-I$(top_srcdir)/opt/copy-propagation \
@@ -36,6 +35,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/evaluate_type_checks \
 	-I$(top_srcdir)/opt/final_inline \
 	-I$(top_srcdir)/opt/init-classes \
+	-I$(top_srcdir)/opt/insert-source-blocks \
 	-I$(top_srcdir)/opt/instrument \
 	-I$(top_srcdir)/opt/int_type_patcher \
 	-I$(top_srcdir)/opt/interdex \
@@ -56,6 +56,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/peephole \
 	-I$(top_srcdir)/opt/print-members \
 	-I$(top_srcdir)/opt/print-kotlin-stats \
+	-I$(top_srcdir)/opt/reachable-natives \
 	-I$(top_srcdir)/opt/rearrange-enum-clinit \
 	-I$(top_srcdir)/opt/rebindrefs \
 	-I$(top_srcdir)/opt/reduce-array-literals \
@@ -67,7 +68,6 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/remove-apilevel-checks \
 	-I$(top_srcdir)/opt/remove-builders \
 	-I$(top_srcdir)/opt/remove_empty_classes \
-	-I$(top_srcdir)/opt/remove-interfaces \
 	-I$(top_srcdir)/opt/remove-nullcheck-string-arg \
 	-I$(top_srcdir)/opt/remove-recursive-locks \
 	-I$(top_srcdir)/opt/remove_redundant_check_casts \
@@ -82,7 +82,6 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/resource-value-merging-pass \
 	-I$(top_srcdir)/opt/result-propagation \
 	-I$(top_srcdir)/opt/shrinker \
-	-I$(top_srcdir)/opt/shorten-srcstrings \
 	-I$(top_srcdir)/opt/singleimpl \
 	-I$(top_srcdir)/opt/split_huge_switches \
 	-I$(top_srcdir)/opt/split_resource_tables \
@@ -92,6 +91,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/string_concatenator \
 	-I$(top_srcdir)/opt/strip-debug-info \
 	-I$(top_srcdir)/opt/synth \
+	-I$(top_srcdir)/opt/synthetic-block-counts \
 	-I$(top_srcdir)/opt/test_cfg \
 	-I$(top_srcdir)/opt/throw-propagation \
 	-I$(top_srcdir)/opt/track_resources \
@@ -105,10 +105,10 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/opt/virtual_merging \
 	-I$(top_srcdir)/opt/virtual_scope \
 	-I$(top_srcdir)/service/api-levels \
+	-I$(top_srcdir)/service/atomic-field-updaters \
 	-I$(top_srcdir)/service/branch-prefix-hoisting \
 	-I$(top_srcdir)/service/class-init \
 	-I$(top_srcdir)/service/class-merging \
-	-I$(top_srcdir)/service/class-splitting \
 	-I$(top_srcdir)/service/constant-propagation \
 	-I$(top_srcdir)/service/copy-propagation \
 	-I$(top_srcdir)/service/cross-dex-ref-minimizer \
@@ -134,6 +134,7 @@ COMMON_INCLUDES = \
 	-I$(top_srcdir)/service/remove_redundant_check_casts \
 	-I$(top_srcdir)/service/resources \
 	-I$(top_srcdir)/service/shrinker \
+	-I$(top_srcdir)/service/stringbuilder \
 	-I$(top_srcdir)/service/switch-dispatch \
 	-I$(top_srcdir)/service/switch-partitioning \
 	-I$(top_srcdir)/service/type-analysis \

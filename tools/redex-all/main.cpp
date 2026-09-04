@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -40,6 +41,7 @@
 
 #include "AggregateException.h"
 #include "ChromeTraceWriter.h"
+#include "ClassOrderSample.h"
 #include "CommandProfiling.h"
 #include "ConfigFiles.h"
 #include "ControlFlow.h" // To set s_DEBUG.
@@ -50,6 +52,7 @@
 #include "DexLoader.h"
 #include "DexOutput.h"
 #include "DexPosition.h"
+#include "DexVt.h"
 #include "DuplicateClasses.h"
 #include "GlobalConfig.h"
 #include "IODIMetadata.h"
@@ -59,6 +62,7 @@
 #include "KeepReason.h"
 #include "Macros.h"
 #include "MallocDebug.h"
+#include "MethodProfiles.h"
 #include "NoOptimizationsMatcher.h"
 #include "OptData.h"
 #include "PassRegistry.h"
@@ -66,6 +70,7 @@
 #include "ProguardMatcher.h"
 #include "ProguardParser.h" // New ProGuard Parser
 #include "ProguardPrintConfiguration.h" // New ProGuard configuration
+#include "ProguardReporting.h"
 #include "ReachableClasses.h"
 #include "RedexContext.h"
 #include "RedexProperties.h"
@@ -97,6 +102,7 @@ constexpr const char* IODI_METADATA = "iodi-metadata";
 constexpr const char* OPT_DECISIONS = "redex-opt-decisions.json";
 constexpr const char* CLASS_METHOD_INFO_MAP = "redex-class-method-info-map.txt";
 constexpr const char* STRING_LOCALE_DUMP = "redex-string-locales.txt";
+constexpr const char* CLASS_TO_FILES_MAP = "redex-class-to-files-map.txt";
 
 const std::string k_usage_header = "usage: redex-all [options...] dex-files...";
 
@@ -195,7 +201,7 @@ Json::Value default_config() {
   const auto passes = {
       "ReBindRefsPass",   "BridgeSynthInlinePass", "FinalInlinePassV2",
       "DelSuperPass",     "SingleImplPass",        "MethodInlinePass",
-      "StaticReloPassV2", "ShortenSrcStringsPass", "RegAllocPass",
+      "StaticReloPassV2", "RegAllocPass",
   };
   std::istringstream temp_json("{\"redex\":{\"passes\":[]}}");
   Json::Value cfg;
@@ -434,6 +440,12 @@ Arguments parse_args(int argc, char* argv[]) {
       "run redex in verify-none mode\n"
       "  \tThis will activate optimization passes or code in some passes that "
       "wouldn't normally operate with verification enabled.");
+  od.add_options()(
+      "emit-dexvt",
+      po::bool_switch(&args.redex_options.emit_dexvt)->default_value(false),
+      "Emit the dexvt build-side export (symbolicated disassembly + per-method "
+      "PGO + authoritative sizes + xref) as NDJSON in the output metadata "
+      "dir.");
   od.add_options()(
       "is-art-build",
       po::bool_switch(&args.redex_options.is_art_build)->default_value(false),
@@ -1031,6 +1043,87 @@ Json::Value get_output_stats(
   return d;
 }
 
+// Emit a segment-aware, stratified fingerprint of the main APK's class
+// placement, for per-regime cross-build comparison. Only root stores are
+// considered (Voltron modules are excluded); classes are visited in emission
+// order (faithful to the on-disk class_defs order) and bucketed by dex-ordering
+// regime: the primary dex, the betamap-ordered coldstart region, the cold
+// (cross-dex-ref-minimized) region, and the likely-dead (Halfnosis) tail.
+Json::Value get_class_order_sample(const DexStoresVector& stores,
+                                   int cold_cap) {
+  size_t num_root_classes = 0;
+  for (const auto& store : stores) {
+    if (!store.is_root_store()) {
+      continue;
+    }
+    for (const auto& dex : store.get_dexen()) {
+      num_root_classes += dex.size();
+    }
+  }
+  std::vector<class_order_sample::ClassEntry> classes;
+  classes.reserve(num_root_classes);
+
+  // Monotonic across all root stores so dex indices are globally unique (dex 0
+  // is the one true primary dex) even in the unusual multi-root-store case.
+  uint32_t dex_index = 0;
+  for (const auto& store : stores) {
+    if (!store.is_root_store()) {
+      continue;
+    }
+    for (const auto& dex : store.get_dexen()) {
+      for (auto* cls : dex) {
+        // classify() owns the (precedence-sensitive) bucketing rule; here we
+        // just extract the primitive facts it needs from the class.
+        const auto segment = class_order_sample::classify(
+            cls->is_dynamically_dead(),
+            cls->get_perf_sensitive() == PerfSensitiveGroup::BETAMAP_ORDERED,
+            dex_index);
+        classes.push_back({cls->get_deobfuscated_name_or_empty(),
+                           cls->rstate.is_generated(), segment, dex_index});
+      }
+      dex_index++;
+    }
+  }
+
+  // Guard against a non-positive cap: casting a negative int straight to
+  // uint64_t would yield an enormous cap, making threshold() keep the entire
+  // cold segment unsampled and silently defeat the sampling intent. Treat any
+  // non-positive value as "sample no cold classes" instead.
+  const uint64_t cold_cap_bound =
+      cold_cap > 0 ? static_cast<uint64_t>(cold_cap) : 0;
+  auto sample = class_order_sample::build(classes, cold_cap_bound);
+
+  auto seg_to_json = [](const class_order_sample::SegmentSample& seg) {
+    Json::Value hashes(Json::objectValue);
+    for (const auto& sc : seg.sampled) {
+      Json::Value pair(Json::arrayValue);
+      pair.append((Json::UInt)sc.seg_index);
+      pair.append((Json::UInt)sc.dex);
+      hashes[std::to_string(sc.name_hash)] = std::move(pair);
+    }
+    Json::Value v(Json::objectValue);
+    v["hashes"] = std::move(hashes);
+    v["num_classes"] = (Json::UInt)seg.num_classes;
+    v["collisions"] = (Json::UInt)seg.collisions;
+    return v;
+  };
+
+  Json::Value segments(Json::objectValue);
+  segments["primary"] = seg_to_json(sample.primary);
+  segments["betamap"] = seg_to_json(sample.betamap);
+  segments["cold"] = seg_to_json(sample.cold);
+  Json::Value dead(Json::objectValue);
+  dead["num_classes"] = (Json::UInt)sample.dead_num_classes;
+  segments["dead"] = std::move(dead);
+
+  Json::Value val(Json::objectValue);
+  // Report the effective (clamped) cap actually used for sampling, not the raw
+  // configured value, so the metadata matches what the fingerprint reflects.
+  val["cold_cap"] = (Json::UInt64)cold_cap_bound;
+  val["segments"] = std::move(segments);
+  return val;
+}
+
 Json::Value get_threads_stats() {
   Json::Value d;
   d["used"] = (Json::UInt64)redex_parallel::default_num_threads();
@@ -1184,10 +1277,16 @@ void dump_keep_reasons(const ConfigFiles& conf,
   }
 }
 
-void process_proguard_rules(ConfigFiles& conf,
-                            Scope& scope,
-                            Scope& external_classes,
-                            keep_rules::ProguardConfiguration& pg_config) {
+void process_proguard_rules(
+    ConfigFiles& conf,
+    const DexStoresVector& stores,
+    Scope& scope,
+    Scope& external_classes,
+    keep_rules::ProguardConfiguration& pg_config,
+    bool dump_proguard_lens,
+    const keep_rules::proguard_parser::Stats& parser_stats,
+    const keep_rules::proguard_parser::Diagnostics& parser_diagnostics,
+    size_t blocklisted_rules) {
   bool keep_all_annotation_classes;
   conf.get_json_config().get("keep_all_annotation_classes", true,
                              keep_all_annotation_classes);
@@ -1226,6 +1325,17 @@ void process_proguard_rules(ConfigFiles& conf,
                         }()
                             .c_str());
     }
+  }
+  if (dump_proguard_lens) {
+    redex::dump_proguard_lens_json(
+        conf.metafile("redex-proguard-lens-initial.json"),
+        stores,
+        "initial",
+        &pg_config,
+        &proguard_rule_recorder,
+        &parser_stats,
+        &parser_diagnostics,
+        blocklisted_rules);
   }
 }
 
@@ -1323,6 +1433,30 @@ ProguardConfig load_early_pg_config(ConfigFiles& conf) {
   return pg_conf;
 }
 
+// Emits `<deobfuscated class name>,<source file>` for every class that carries
+// a source file. Must run in the frontend: StripDebugInfoPass clears the source
+// file of every class (drop_src_files defaults to true), so the mapping is only
+// recoverable at load time.
+void dump_class_to_files_map(const std::string& file_path,
+                             const DexStoresVector& stores) {
+  std::ofstream ofs(file_path, std::ofstream::out | std::ofstream::trunc);
+  for (const auto& store : stores) {
+    for (const auto& classes : store.get_dexen()) {
+      for (const auto* cls : classes) {
+        const auto* source_file = cls->get_source_file();
+        if (source_file == nullptr) {
+          continue;
+        }
+        auto name = cls->get_deobfuscated_name_or_empty();
+        if (name.empty()) {
+          name = cls->get_name()->str();
+        }
+        ofs << name << "," << source_file->str() << '\n';
+      }
+    }
+  }
+}
+
 /**
  * Pre processing steps: load dex and configurations
  */
@@ -1330,16 +1464,20 @@ void redex_frontend(ConfigFiles& conf, /* input */
                     Arguments& args, /* inout */
                     keep_rules::ProguardConfiguration& pg_config,
                     DexStoresVector& stores,
+                    bool dump_proguard_lens,
                     Json::Value& stats) {
   Timer redex_frontend_timer("Redex_frontend");
 
   g_redex->load_pointers_cache();
 
   keep_rules::proguard_parser::Stats parser_stats{};
+  keep_rules::proguard_parser::Diagnostics parser_diagnostics{};
   for (const auto& pg_config_path : args.proguard_config_paths) {
     Timer time_pg_parsing("Parsed ProGuard config file");
-    parser_stats +=
-        keep_rules::proguard_parser::parse_file(pg_config_path, &pg_config);
+    parser_stats += keep_rules::proguard_parser::parse_file(
+        pg_config_path,
+        &pg_config,
+        dump_proguard_lens ? &parser_diagnostics : nullptr);
   }
 
   size_t blocklisted_rules{0};
@@ -1434,6 +1572,9 @@ void redex_frontend(ConfigFiles& conf, /* input */
       apply_deobfuscated_names(store.get_dexen(), conf.get_proguard_map());
     }
   });
+  Timer::scope("Writing class to files map", [&] {
+    dump_class_to_files_map(conf.metafile(CLASS_TO_FILES_MAP), stores);
+  });
   DexStoreClassesIterator it(stores);
   Scope scope = build_class_scope(it);
   Timer::scope("No Optimizations Rules", [&] {
@@ -1447,7 +1588,15 @@ void redex_frontend(ConfigFiles& conf, /* input */
     init_reachable_classes(scope, ReachableClassesConfig(json_config));
   });
   Timer::scope("Processing proguard rules", [&] {
-    process_proguard_rules(conf, scope, external_classes, pg_config);
+    process_proguard_rules(conf,
+                           stores,
+                           scope,
+                           external_classes,
+                           pg_config,
+                           dump_proguard_lens,
+                           parser_stats,
+                           parser_diagnostics,
+                           blocklisted_rules);
   });
 
   TRACE(NATIVE, 2, "Blanket native classes: %zu",
@@ -1488,10 +1637,6 @@ void check_required_resources(ConfigFiles& conf, bool pre_run) {
 // modification.
 void finalize_resource_table(ConfigFiles& conf) {
   if (!conf.finalize_resource_table()) {
-    return;
-  }
-  const auto& json = conf.get_json_config();
-  if (json.get("after_pass_size", false)) {
     return;
   }
 
@@ -1554,8 +1699,24 @@ void redex_backend(ConfigFiles& conf,
   const RedexOptions& redex_options = manager.get_redex_options();
   const auto& output_dir = conf.get_outdir();
 
+  // dexvt is enabled either as a redex-all CLI switch (--emit-dexvt, for
+  // redex.py direct runs) or via the JSON config key emit_dexvt=true -- the
+  // latter lets an app build turn it on through the standard
+  // `redex.extra_args=-J emit_dexvt=true` path without a bespoke passthrough.
+  const bool emit_dexvt = redex_options.emit_dexvt ||
+                          conf.get_json_config().get("emit_dexvt", false);
+
   finalize_resource_table(conf);
   check_required_resources(conf, false);
+
+  // dexvt: pre-lowering capture (disasm + per-block SourceBlocks + PGO + xref).
+  // Must run before instruction_lowering::run — the CFG is cleared by
+  // PassManager before the backend, so the capture rebuilds it per method.
+  dexvt::Exporter dexvt_exporter;
+  if (emit_dexvt) {
+    Timer t("dexvt pre-lowering capture");
+    dexvt_exporter.capture_pre_lowering(stores, conf);
+  }
 
   instruction_lowering::Stats instruction_lowering_stats;
   {
@@ -1609,9 +1770,16 @@ void redex_backend(ConfigFiles& conf,
     iodi_mem_stats.trace_log("Compute initial IODI metadata");
   }
 
-  const auto& dex_output_config =
+  auto& dex_output_config =
       *conf.get_global_config().get_config_by_name<DexOutputConfig>(
           "dex_output");
+
+  // dexvt needs the authoritative per-class and per-method sizes, both gated
+  // off by default. Force them on so output_totals carries the size maps.
+  if (emit_dexvt) {
+    dex_output_config.write_class_sizes = true;
+    dex_output_config.write_method_sizes = true;
+  }
 
   auto string_sort_mode = get_string_sort_mode(conf);
 
@@ -1690,6 +1858,18 @@ void redex_backend(ConfigFiles& conf,
 
   sanitizers::lsan_do_recoverable_leak_check();
 
+  // dexvt: post-lowering emit. output_totals carries the authoritative
+  // per-class and per-method sizes accumulated across dexes.
+  if (emit_dexvt) {
+    Timer t("dexvt emit");
+    // Retry lazy method-profile resolution so the manifest's resolution counts
+    // are final. Note: PassManager::set_metric is pass-scoped and must NOT be
+    // called here (no active pass in redex_backend); resolution health is
+    // reported in the artifact manifest instead (see Exporter::emit).
+    conf.process_unresolved_method_profile_lines();
+    dexvt_exporter.emit(conf, output_totals);
+  }
+
   std::vector<DexMethod*> needs_debug_line_mapping;
 
   Timer::scope("Writing opt decisions data", [&] {
@@ -1721,6 +1901,10 @@ void redex_backend(ConfigFiles& conf,
       stats["output_stats"] =
           get_output_stats(output_totals, output_dexes_stats, manager,
                            instruction_lowering_stats, pos_mapper.get());
+      if (dex_output_config.emit_class_order_sample) {
+        stats["output_stats"]["class_order_sample"] = get_class_order_sample(
+            stores, dex_output_config.class_order_sample_cap);
+      }
     });
     print_warning_summary();
 
@@ -2008,6 +2192,13 @@ int main(int argc, char* argv[]) {
     constant_propagation::known_non_null_returns_enable =
         args.config.get("enable_known_non_null_returns", false).asBool();
 
+    constant_propagation::enable_check_cast_value_preservation =
+        args.config.get("enable_check_cast_value_preservation", false).asBool();
+
+    // TODO(T275196808): Remove this.
+    constant_propagation::enable_param_exit_value_summary =
+        args.config.get("enable_param_exit_value_summary", false).asBool();
+
     // For convenience.
     g_redex->instrument_mode = args.redex_options.instrument_pass_enabled;
     if (g_redex->instrument_mode) {
@@ -2035,6 +2226,7 @@ int main(int argc, char* argv[]) {
     slow_invariants_debug =
         args.config.get("slow_invariants_debug", false).asBool();
     g_redex->slow_invariants_debug = slow_invariants_debug;
+    g_redex->insert_remarks = args.config.get("insert_remarks", false).asBool();
     cfg::ControlFlowGraph::s_DEBUG =
         cfg::ControlFlowGraph::s_DEBUG || slow_invariants_debug;
     if (slow_invariants_debug) {
@@ -2073,10 +2265,13 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    bool dump_proguard_lens =
+        args.config.get("dump_proguard_lens", false).asBool();
+
     {
       auto profile_frontend =
           ScopedCommandProfiling::maybe_from_env("FRONTEND_", "frontend");
-      redex_frontend(conf, args, *pg_config, stores, stats);
+      redex_frontend(conf, args, *pg_config, stores, dump_proguard_lens, stats);
       conf.parse_global_config();
       if (args.redex_options.instrument_pass_enabled) {
         auto* global_resources_config =
@@ -2088,6 +2283,7 @@ int main(int argc, char* argv[]) {
     }
 
     g_redex->disable_violation_fixes = conf.disable_violation_fixes();
+    g_redex->preserve_count_integrity = conf.preserve_count_integrity();
 
     if (conf.evaluate_package_name()) {
       args.redex_options.package_name = resources->get_manifest_package_name();
@@ -2119,6 +2315,11 @@ int main(int argc, char* argv[]) {
       manager.run_passes(stores, conf);
       maybe_dump_jemalloc_profile("MALLOC_PROFILE_DUMP_AFTER_ALL_PASSES");
     });
+
+    if (dump_proguard_lens) {
+      redex::dump_proguard_lens_json(
+          conf.metafile("redex-proguard-lens-final.json"), stores, "final");
+    }
 
     if (args.stop_pass_idx == std::nullopt) {
       // Call redex_backend by default

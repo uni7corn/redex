@@ -7,15 +7,20 @@
 
 #include "Inliner.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "ApiLevelChecker.h"
 #include "CFGInliner.h"
 #include "ClassUtil.h"
 #include "ConstantPropagationAnalysis.h"
 #include "ConstructorAnalysis.h"
+#include "Debug.h"
 #include "DexInstruction.h"
 #include "InlineForSpeed.h"
 #include "InlinerConfig.h"
@@ -45,6 +50,34 @@ constexpr uint64_t HARD_MAX_INSTRUCTION_SIZE = UINT64_C(1) << 32;
 
 // TODO: Make configurable.
 const uint64_t MAX_HOT_COLD_CALLEE_SIZE = 27;
+
+// A block's execution count: the max-over-interactions synthetic `val` of its
+// first source block (0 when unprofiled / no source block).
+float block_max_count(cfg::Block* block) {
+  return source_blocks::max_val_over_interactions(
+             source_blocks::get_first_source_block(block))
+      .value_or(0.0f);
+}
+
+/*
+ * Whether an invocation naming `callee` verifies at `insn` as far as the
+ * receiver goes, which a static callee trivially does.
+ */
+bool has_receiver_of_callee_class(const IRInstruction* insn,
+                                  const DexMethod* callee) {
+  return is_static(callee) ||
+         type::check_cast(insn->get_method()->get_class(), callee->get_class());
+}
+
+/*
+ * The type the receiver of `insn` must be cast to for an invocation naming
+ * `callee` to verify, or nullptr if no cast is needed.
+ */
+const DexType* get_needs_receiver_cast(const IRInstruction* insn,
+                                       const DexMethod* callee) {
+  return has_receiver_of_callee_class(insn, callee) ? nullptr
+                                                    : callee->get_class();
+}
 
 /*
  * Given a method, gather all resolved init-class instruction types. This
@@ -195,10 +228,9 @@ MultiMethodInliner::MultiMethodInliner(
                             .second;
         always_assert(emplaced);
       }
-      insert_unordered_iterable(
-          m_inlined_invokes_need_cast,
-          callee_callers.second.inlined_invokes_need_cast);
     }
+    insert_unordered_iterable(m_inlined_invokes_need_cast,
+                              callee_callers.second.inlined_invokes_need_cast);
   }
   if (mode == IntraDex) {
     m_x_dex = std::make_unique<XDexMethodRefs>(stores);
@@ -292,6 +324,10 @@ MultiMethodInliner::MultiMethodInliner(
         },
         methods);
   }
+
+  if (m_inliner_cost_config.inline_hot_callsite_count_percentile > 0) {
+    build_hot_callsite_count_ramp();
+  }
 }
 
 void MultiMethodInliner::inline_methods() {
@@ -346,7 +382,7 @@ void MultiMethodInliner::inline_methods() {
         m_shrinker, m_callee_caller, m_caller_callee,
         [this](DexMethod* caller, IRInstruction* insn) -> DexMethod* {
           auto callee_opt = this->get_callee(caller, insn);
-          return callee_opt ? callee_opt->method : nullptr;
+          return callee_opt.value_or(nullptr);
         },
         [this](DexMethod* callee) -> bool {
           return (m_recursive_callees.count(callee) != 0u) || root(callee) ||
@@ -395,8 +431,8 @@ void MultiMethodInliner::inline_methods() {
   info.waited_seconds = m_scheduler.get_thread_pool().get_waited_seconds();
 }
 
-std::optional<Callee> MultiMethodInliner::get_callee(DexMethod* caller,
-                                                     IRInstruction* insn) {
+std::optional<DexMethod*> MultiMethodInliner::get_callee(DexMethod* caller,
+                                                         IRInstruction* insn) {
   if (!opcode::is_an_invoke(insn->opcode())) {
     return std::nullopt;
   }
@@ -404,7 +440,7 @@ std::optional<Callee> MultiMethodInliner::get_callee(DexMethod* caller,
       m_concurrent_resolver(insn->get_method(), opcode_to_search(insn), caller);
   auto it = m_caller_virtual_callees.find(caller);
   if (it == m_caller_virtual_callees.end()) {
-    return std::make_optional<Callee>({callee, /* true_virtual */ false});
+    return callee;
   }
   const auto& cvc = it->second;
   auto it2 = cvc.insns.find(insn);
@@ -413,9 +449,9 @@ std::optional<Callee> MultiMethodInliner::get_callee(DexMethod* caller,
     // it's not exclusive to matching true virtuals.
     return cvc.exclusive_callees.count(callee) != 0u
                ? std::nullopt
-               : std::make_optional<Callee>({callee, /* true_virtual */ true});
+               : std::make_optional(callee);
   }
-  return std::make_optional<Callee>({it2->second, /* true_virtual */ false});
+  return it2->second;
 }
 
 void MultiMethodInliner::inline_callees(DexMethod* caller,
@@ -438,8 +474,7 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
         if (!callee_opt) {
           continue;
         }
-        auto* callee = callee_opt->method;
-        auto true_virtual = callee_opt->true_virtual;
+        auto* callee = *callee_opt;
         if (callees.count(callee) == 0u) {
           continue;
         }
@@ -463,7 +498,7 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
             no_return = false;
             reduced_code = nullptr;
             insn_size = get_callee_insn_size(callee);
-          } else if (should_partially_inline(block, insn, true_virtual, callee,
+          } else if (should_partially_inline(block, insn, callee,
                                              &partial_code)) {
             partial = true;
             reduced_code = partial_code.reduced_code;
@@ -495,9 +530,7 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
           }
         }
 
-        auto it2 = m_inlined_invokes_need_cast.find(insn);
-        const auto* needs_receiver_cast =
-            it2 == m_inlined_invokes_need_cast.end() ? nullptr : it2->second;
+        const auto* needs_receiver_cast = get_recorded_receiver_cast(insn);
         inlinables.push_back((Inlinable){callee, insn, no_return, partial,
                                          for_speed, std::move(reduced_code),
                                          insn_size, needs_receiver_cast});
@@ -521,11 +554,9 @@ size_t MultiMethodInliner::inline_callees(
       if (!callee_opt) {
         continue;
       }
-      auto* callee = callee_opt->method;
+      auto* callee = *callee_opt;
       always_assert(callee->is_concrete());
-      auto it2 = m_inlined_invokes_need_cast.find(insn);
-      const auto* needs_receiver_cast =
-          it2 == m_inlined_invokes_need_cast.end() ? nullptr : it2->second;
+      const auto* needs_receiver_cast = get_recorded_receiver_cast(insn);
       inlinables.push_back((Inlinable){callee, insn, false, false, false,
                                        nullptr, get_callee_insn_size(callee),
                                        needs_receiver_cast});
@@ -549,12 +580,7 @@ size_t MultiMethodInliner::inline_callees(
     auto* callee = it->second;
     always_assert(callee->is_concrete());
     always_assert(opcode::is_an_invoke(insn->opcode()));
-    auto* needs_receiver_cast =
-        is_static(callee) ||
-                type::check_cast(mie.insn->get_method()->get_class(),
-                                 callee->get_class())
-            ? nullptr
-            : callee->get_class();
+    const auto* needs_receiver_cast = get_needs_receiver_cast(insn, callee);
     inlinables.push_back((Inlinable){callee, insn, false, false, false, nullptr,
                                      get_callee_insn_size(callee),
                                      needs_receiver_cast});
@@ -622,7 +648,8 @@ void MultiMethodInliner::make_partial(const DexMethod* method,
       (m_hot_methods.count_unsafe(method) != 0u) &&
       inlined_cost->reduced_code) {
     inlined_cost->partial_code = inliner::get_partially_inlined_code(
-        method, inlined_cost->reduced_code->cfg());
+        method, inlined_cost->reduced_code->cfg(),
+        m_config.max_partially_inlined_code_units);
   }
   inlined_cost->reduced_code.reset();
 }
@@ -1345,15 +1372,17 @@ PartialCode MultiMethodInliner::get_callee_partial_code(
     return PartialCode();
   }
   if (!m_callee_partial_code) {
-    return inliner::get_partially_inlined_code(callee,
-                                               callee->get_code()->cfg());
+    return inliner::get_partially_inlined_code(
+        callee, callee->get_code()->cfg(),
+        m_config.max_partially_inlined_code_units);
   }
   return *m_callee_partial_code
               ->get_or_create_and_assert_equal(
                   callee,
                   [&](const auto&) {
                     return inliner::get_partially_inlined_code(
-                        callee, callee->get_code()->cfg());
+                        callee, callee->get_code()->cfg(),
+                        m_config.max_partially_inlined_code_units);
                   })
               .first;
 }
@@ -1881,7 +1910,6 @@ bool MultiMethodInliner::can_inline_init(const DexMethod* init_method) {
                     // stack trace in a way that is sensitive to inlining.
                     bool relaxed =
                         m_config.relaxed_init_inline &&
-                        m_shrinker.min_sdk() >= 21 &&
                         !klass::maybe_anonymous_class(
                             type_class(init_method->get_class())) &&
                         !is_finalizable(init_method->get_class()) &&
@@ -2085,24 +2113,62 @@ bool MultiMethodInliner::should_inline_at_call_site(
   return true;
 }
 
+const DexType* MultiMethodInliner::get_recorded_receiver_cast(
+    IRInstruction* insn) const {
+  auto it = m_inlined_invokes_need_cast.find(insn);
+  return it == m_inlined_invokes_need_cast.end() ? nullptr : it->second;
+}
+
+bool MultiMethodInliner::can_invoke_callee_directly(
+    IRInstruction* insn, const DexMethod* callee) const {
+  auto op = insn->opcode();
+  auto fallback_op = inliner::get_fallback_invoke_opcode(callee);
+  if (fallback_op == OPCODE_INVOKE_STATIC) {
+    return op == OPCODE_INVOKE_STATIC;
+  }
+  // A virtual fallback re-resolves the callee against the receiver's runtime
+  // class. An invoke-interface original does the same, so devirtualizing it is
+  // fine; an invoke-super or invoke-direct original deliberately does not.
+  //
+  // Invoke-super is excluded for cost, not for soundness. The peeled-off code
+  // is spliced into the very caller the instruction sat in, and invoke-super is
+  // interpreted relative to the enclosing class, so an invoke-super fallback
+  // would reach the same target without any further analysis. Taking it needs a
+  // second variant of the peeled-off code per callee, which means keying both
+  // the `get_callee_partial_code` cache and `InlinedCost::partial_code` by
+  // variant, and it leaves a live invoke-super in inlined code, where
+  // `CFGInliner::rewrite_invoke_supers` is waiting to rewrite it.
+  bool dispatches_alike =
+      fallback_op == OPCODE_INVOKE_VIRTUAL
+          ? (op == OPCODE_INVOKE_VIRTUAL || op == OPCODE_INVOKE_INTERFACE)
+          : op == fallback_op;
+  if (!dispatches_alike) {
+    return false;
+  }
+  const auto* recorded_cast = get_recorded_receiver_cast(insn);
+  if (recorded_cast != nullptr) {
+    // The receiver gets cast ahead of the inlined code, so the fallback sees
+    // the cast value rather than the original one.
+    return type::check_cast(recorded_cast, callee->get_class());
+  }
+  return has_receiver_of_callee_class(insn, callee);
+}
+
 bool MultiMethodInliner::should_partially_inline(cfg::Block* block,
                                                  IRInstruction* insn,
-                                                 bool true_virtual,
                                                  DexMethod* callee,
                                                  PartialCode* partial_code) {
   always_assert(opcode::is_an_invoke(insn->opcode()));
   always_assert(insn->has_method());
-  // We don't want to partially inline true virtuals.
-  // To avoid dealing with inserting additional casts, we also avoid callees
-  // which don't match the formal method given by the instruction exactly. We
-  // also don't want to attempt to partially inline an invoke-super instruction,
-  // as this would make it necessary to track different versions of
-  // partially-inlined code based on the invoke-instruction, as then the
-  // fallback invocation that's contained in the partial code may have to be
-  // either invoke-super or invoke-virtual depending on the context.
-  if (!m_config.partial_hot_hot_inline || true_virtual ||
-      insn->get_method() != callee || insn->opcode() == OPCODE_INVOKE_SUPER ||
-      !source_blocks::is_hot(block)) {
+  // Partial inlining peels off the callee's hot prefix and lets the peeled-off
+  // code fall back to a plain invocation of the callee, which must be a valid
+  // stand-in for the instruction it replaces.
+  //
+  // That the peeled-off prefix is the code that would actually run at this
+  // callsite is not established here: everything `get_callee` hands out is the
+  // implementation that the receiver dispatches to.
+  if (!m_config.partial_hot_hot_inline || !source_blocks::is_hot(block) ||
+      !can_invoke_callee_directly(insn, callee)) {
     return false;
   }
   // If we don't already have pre-computed partially inlined code for this
@@ -2650,14 +2716,103 @@ void MultiMethodInliner::delayed_invoke_direct_to_static() {
   m_delayed_make_static.clear();
 }
 
+// 4096 buckets is ~0.024 percentile of resolution -- far finer than the ramp's
+// curvature -- and keeps the table at 32KB no matter how large the app is.
+constexpr size_t HOT_CALLSITE_QUANTILES = 4096;
+
+void MultiMethodInliner::build_hot_callsite_count_ramp() {
+  const auto& cc = m_inliner_cost_config;
+  // The distribution is one entry per profiled, positive-count block that holds
+  // a callsite (invoke). `gather_block_counts` reduces each block to its
+  // source-block execution count; the filter keeps only invoke blocks.
+  std::vector<float> counts = source_blocks::gather_block_counts(
+      m_scope, [](DexMethod*, cfg::Block* block) {
+        for (const auto& mie : InstructionIterable(block)) {
+          if (opcode::is_an_invoke(mie.insn->opcode())) {
+            return true;
+          }
+        }
+        return false;
+      });
+  // Sorts `counts` in place, which the quantile table below relies on.
+  m_hot_callsite_count_cutoff = source_blocks::rank_cutoff_for_percentile(
+      counts, cc.inline_hot_callsite_count_percentile);
+
+  const int p_start = cc.inline_hot_callsite_count_percentile;
+  const int p_top = cc.inline_hot_callsite_count_top_percentile;
+  const float d_start = cc.inline_hot_callsite_count_discount;
+  const float d_top = cc.inline_hot_callsite_count_top_discount;
+  always_assert_log(
+      (p_top > 0) == (d_top > 0.0f),
+      "inline_hot_callsite_count_top_percentile and _top_discount must be set "
+      "together; got %d and %f",
+      p_top, d_top);
+  if (p_top <= 0) {
+    // No ramp configured: flat step at d_start for everything above the cutoff.
+    return;
+  }
+  always_assert_log(p_top > p_start && p_top <= 100,
+                    "inline_hot_callsite_count_top_percentile must be in (%d, "
+                    "100], got %d",
+                    p_start, p_top);
+  always_assert_log(d_top <= d_start && d_start <= 1.0f,
+                    "need 0 < d_top <= d_start <= 1, got %f and %f", d_top,
+                    d_start);
+  if (counts.empty()) {
+    return;
+  }
+  m_hot_callsite_count_quantiles.reserve(HOT_CALLSITE_QUANTILES);
+  m_hot_callsite_count_discounts.reserve(HOT_CALLSITE_QUANTILES);
+  const double span = HOT_CALLSITE_QUANTILES - 1;
+  for (size_t i = 0; i != HOT_CALLSITE_QUANTILES; ++i) {
+    auto idx = static_cast<size_t>((static_cast<double>(i) / span) *
+                                   static_cast<double>(counts.size() - 1));
+    m_hot_callsite_count_quantiles.push_back(counts[idx]);
+    double p = 100.0 * static_cast<double>(i) / span;
+    double x = std::clamp((p - p_start) / static_cast<double>(p_top - p_start),
+                          0.0, 1.0);
+    m_hot_callsite_count_discounts.push_back(
+        static_cast<float>(d_start * std::pow(d_top / d_start, x)));
+  }
+}
+
+float MultiMethodInliner::hot_callsite_count_discount(float count) const {
+  // Require a positive count: an unprofiled/cold callsite (count 0) must never
+  // qualify, even when the cutoff degenerates to -inf (percentile <= 0).
+  if (count <= 0.0f || count < m_hot_callsite_count_cutoff) {
+    return 1.0f;
+  }
+  if (m_hot_callsite_count_quantiles.empty()) {
+    return m_inliner_cost_config.inline_hot_callsite_count_discount;
+  }
+  auto it = std::upper_bound(m_hot_callsite_count_quantiles.begin(),
+                             m_hot_callsite_count_quantiles.end(), count);
+  auto i = static_cast<size_t>(it - m_hot_callsite_count_quantiles.begin());
+  return m_hot_callsite_count_discounts[std::min(
+      i, m_hot_callsite_count_discounts.size() - 1)];
+}
+
 float MultiMethodInliner::compute_profile_guided_discount(
     DexMethod* caller,
     DexMethod* callee,
     float inline_cost,
     cfg::Block* caller_block,
     ReducedCode* reduced_callee) {
+  float discount = 1.0f;
+
+  // [experimental] Callsite-count-percentile lever, independent of the
+  // baseline-profile discount below: the hotter a callsite is within the
+  // profiled (positive-count) callsite distribution, the more its local inline
+  // cost is scaled down, so a genuinely hot callsite inlines a callee the flat
+  // cost model would otherwise reject. NFC when the lever is off -- the cutoff
+  // stays +inf, so nothing qualifies.
+  if (m_inliner_cost_config.inline_hot_callsite_count_percentile > 0 &&
+      caller_block != nullptr) {
+    discount *= hot_callsite_count_discount(block_max_count(caller_block));
+  }
+
   if (!m_baseline_profile) {
-    return 1.0f;
+    return discount;
   }
 
   // Discounts only given to calls found to be hot with a high enough appear
@@ -2668,7 +2823,7 @@ float MultiMethodInliner::compute_profile_guided_discount(
           m_inliner_cost_config.profile_guided_block_appear_threshold) ||
       m_baseline_profile->methods.count(caller) == 0 ||
       !m_baseline_profile->methods.at(caller).hot) {
-    return 1.0;
+    return discount;
   }
 
   const auto* full_cost = get_fully_inlined_cost(callee);
@@ -2676,7 +2831,7 @@ float MultiMethodInliner::compute_profile_guided_discount(
   // inlined by the ART compiler, so we do not try to bias Redex into inlining.
   constexpr size_t size_threshold = 32;
   if (full_cost->full_code <= size_threshold) {
-    return 1.0f;
+    return discount;
   }
 
   // Bias toward inlining if the inlined code is smaller than the original.
@@ -2714,7 +2869,7 @@ float MultiMethodInliner::compute_profile_guided_discount(
     heat_discount += 1.0;
   }
 
-  return static_cast<float>(shrink_discount * heat_discount);
+  return static_cast<float>(discount * shrink_discount * heat_discount);
 }
 
 namespace inliner {

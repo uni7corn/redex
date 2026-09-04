@@ -12,6 +12,7 @@
 #include <json/json.h>
 
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexStore.h"
 #include "Show.h"
 #include "WorkQueue.h"
@@ -264,7 +265,7 @@ XStoreRefs::XStoreRefs(const DexStoresVector& stores,
   workqueue_run_for<size_t>(0, dexes.size(), [&](size_t i) {
     auto [dex, store_idx] = dexes[i];
     for (auto* cls : *dex) {
-      m_xstores.emplace(cls->get_type(), store_idx);
+      m_store_idx_by_type.emplace(cls->get_type(), store_idx);
     }
   });
 }

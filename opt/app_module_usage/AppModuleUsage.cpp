@@ -7,15 +7,14 @@
 
 #include "AppModuleUsage.h"
 
-#include <algorithm>
 #include <fstream>
 #include <optional>
-#include <sstream>
 #include <string>
 
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
 #include "CppUtil.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexAnnotation.h"
 #include "DexClass.h"

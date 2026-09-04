@@ -12,19 +12,18 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "ConfigFiles.h"
+#include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "GlobalConfig.h"
 #include "InitClassesWithSideEffects.h"
 #include "Inliner.h"
-#include "InlinerConfig.h"
 #include "LoopInfo.h"
 #include "RedexContext.h"
 #include "ScopedMetrics.h"

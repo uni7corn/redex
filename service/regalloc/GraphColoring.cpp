@@ -810,14 +810,35 @@ UnorderedMap<reg_t, cfg::InstructionIterator> Allocator::find_param_splits(
         idom = doms.intersect(idom, block_uses[index]);
       }
       TRACE(REG, 5, "Inserting param load of v%u in B%zu", param, idom->id());
-      // We need to check insn before end of block to make sure we didn't
-      // insert load after branches.
+      // Record the param reload at the end of the immediate dominator, but
+      // never past a terminator -- appending after one is illegal (asserts in
+      // ControlFlowGraph::insert). Leaving `insn_it` pointing AT the
+      // instruction makes split_params insert the load before it, the correct
+      // dominating spot. An instruction that transfers control via a throw
+      // (EDGE_THROW) edge -- a `throw`, or any `may_throw` insn -- can reach
+      // catch-handler blocks that hold the param's uses, so the load must
+      // precede it too. (This is why a throw block can legitimately be the idom
+      // here: a try-region body whose param is used in its own catch handlers.)
       auto insn_it = idom->get_last_insn();
-      if (insn_it != idom->end() &&
-          !opcode::is_branch(insn_it->insn->opcode()) &&
-          !opcode::may_throw(insn_it->insn->opcode())) {
-        ++insn_it;
-        always_assert(insn_it == idom->end());
+      if (insn_it != idom->end()) {
+        auto last_op = insn_it->insn->opcode();
+        // A `return` block has no real successors (only a ghost edge to the
+        // synthetic exit), so it can never be the immediate dominator of the
+        // >1 distinct use blocks this branch handles (find_first_uses dedups
+        // blocks). Assert the invariant rather than silently guarding it: if it
+        // ever fires, the CFG is malformed and a load placed here would not
+        // dominate the uses.
+        always_assert_log(!opcode::is_a_return(last_op),
+                          "param-split idom B%zu of v%u ends in return",
+                          idom->id(), param);
+        // Advance past the last instruction only when appending after it is
+        // safe -- not a terminator (`opcode::is_terminal`: branch/throw; return
+        // is excluded by the assert above) and not a `may_throw` insn (see the
+        // throw-edge note above).
+        if (!opcode::is_terminal(last_op) && !opcode::may_throw(last_op)) {
+          ++insn_it;
+          always_assert(insn_it == idom->end());
+        }
       }
       auto emplaced =
           load_locations
@@ -860,28 +881,44 @@ void Allocator::split_params(const interference::Graph& ig,
     return;
   }
 
-  // Remap the operands of the load-param opcodes
+  // Remap each load-param's dest to a fresh temp and emit its reload, walking
+  // the load-param instructions in order.
+  //
+  // Several params routinely share one insertion point: every param overwritten
+  // by a later instruction is recorded at the same `pend` in find_param_splits,
+  // and params can also share an idom end or a first use. At a shared point,
+  // whichever move is inserted first ends up first, so this walk decides the
+  // emitted instruction order. The moves are mutually independent -- each dest
+  // is a distinct param and each src a freshly allocated temp, so no move's src
+  // is another's dest -- hence any fixed order is semantically equivalent, and
+  // the load-param sequence is a deterministic one.
+  //
+  // The `pend` reloads land at the end boundary of the very range being walked,
+  // so a move inserted here is visited by this loop. Its dest is the param
+  // symreg, still a key in load_locations, so without the load-param guard it
+  // would be remapped as if it were a param and emit another move, forever.
   auto params = cfg.get_param_instructions();
   auto param_insns = InstructionIterable(params);
-  UnorderedMap<reg_t, reg_t> param_to_temp;
+  size_t emitted = 0;
   for (auto& mie : param_insns) {
     auto* insn = mie.insn;
-    auto dest = insn->dest();
-    if (load_locations.find(dest) != load_locations.end()) {
-      auto temp = cfg.allocate_temp();
-      insn->set_dest(temp);
-      param_to_temp[dest] = temp;
+    if (!opcode::is_a_load_param(insn->opcode())) {
+      continue;
     }
-  }
-  // Insert the loads
-  for (const auto& param_pair : UnorderedIterable(load_locations)) {
-    auto dest = param_pair.first;
-    auto first_use_it = param_pair.second;
-    cfg.insert_before(
-        first_use_it,
-        gen_move(ig.get_node(dest).type(), dest, param_to_temp.at(dest)));
+    auto dest = insn->dest();
+    auto it = load_locations.find(dest);
+    if (it == load_locations.end()) {
+      continue;
+    }
+    auto temp = cfg.allocate_temp();
+    insn->set_dest(temp);
+    cfg.insert_before(it->second,
+                      gen_move(ig.get_node(dest).type(), dest, temp));
     ++m_stats.param_spill_moves;
+    ++emitted;
   }
+  // Every split's param is a load-param dest.
+  always_assert(emitted == load_locations.size());
 }
 
 /*

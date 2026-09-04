@@ -7,7 +7,6 @@
 
 #include "ReflectionAnalysis.h"
 
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <sstream>
 #include <unordered_map>

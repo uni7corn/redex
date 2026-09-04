@@ -6,7 +6,6 @@
  */
 
 #include <memory>
-#include <unordered_map>
 
 #include <gtest/gtest.h>
 
@@ -14,6 +13,7 @@
 #include "MethodSplitter.h"
 
 #include "Creators.h"
+#include "DeterministicContainers.h"
 #include "DexClass.h"
 #include "IRAssembler.h"
 #include "RedexTest.h"
@@ -76,22 +76,32 @@ class MethodSplitterTest : public RedexTest {
       const std::string& sig,
       const std::string& code_str,
       const method_splitting_impl::Config& config,
-      std::initializer_list<std::pair<std::string, std::string>> expected) {
+      std::initializer_list<std::pair<std::string, std::string>> expected,
+      // Auxiliary classes the code under test references. They must go into the
+      // store, not just the global class registry: a type whose class is
+      // internal but held by no store is an illegal cross-store reference, so a
+      // split taking one as an argument would be dropped.
+      const std::vector<DexClass*>& extra_classes = {}) {
     auto [cls, m] = create(sig, code_str);
     m->get_code()->build_cfg();
     DexStoresVector stores;
     stores.emplace_back("test_store");
-    stores.front().get_dexen().push_back({cls});
+    DexClasses dex{cls};
+    dex.insert(dex.end(), extra_classes.begin(), extra_classes.end());
+    stores.front().get_dexen().push_back(std::move(dex));
+    method_splitting_impl::StoreRefCheckers store_ref_checkers(
+        stores, /* normal_primary_dex */ true, /* min_sdk_api */ nullptr);
     method_splitting_impl::Stats stats;
     method_splitting_impl::split_methods_in_stores(
-        stores, /* min_sdk */ 0, config,
+        stores, /* min_sdk */ 0, config, store_ref_checkers,
         /* create_init_class_insns */ false,
         /* reserved_mrefs */ 0, /* reserved_trefs */ 0, &stats);
     m->get_code()->cfg().simplify();
-    for (auto* out : UnorderedIterable(stats.added_methods)) {
+    for (const auto& [out, kind] : stats.added_methods) {
+      (void)kind;
       out->get_code()->cfg().simplify();
     }
-    std::unordered_map<std::string, std::string> expected_map;
+    UnorderedMap<std::string, std::string> expected_map;
     for (const auto& p : expected) {
       expected_map.insert(p);
     }
@@ -123,8 +133,13 @@ class MethodSplitterTest : public RedexTest {
     if (!main_error.empty()) {
       return ::testing::AssertionFailure() << show(m) << ": " << main_error;
     }
-    auto ordered =
-        unordered_to_ordered(stats.added_methods, compare_dexmethods);
+    std::vector<DexMethod*> ordered;
+    ordered.reserve(stats.added_methods.size());
+    for (const auto& [out, kind] : stats.added_methods) {
+      (void)kind;
+      ordered.push_back(out);
+    }
+    std::sort(ordered.begin(), ordered.end(), compare_dexmethods);
     for (auto* out : ordered) {
       auto out_error = compare(out);
       if (!out_error.empty()) {
@@ -756,7 +771,7 @@ TEST_F(MethodSplitterTest, SplitSwitchPreferNotBreakingLargePackedSwitches) {
 TEST_F(MethodSplitterTest, SplitTypeDemands) {
   ClassCreator cc{DexType::make_type("LSpecificType;")};
   cc.set_super(type::java_lang_Object());
-  cc.create();
+  auto* specific_type_cls = cc.create();
 
   const auto* before = R"(
     (
@@ -832,7 +847,8 @@ TEST_F(MethodSplitterTest, SplitTypeDemands) {
            before,
            config,
            {std::make_pair<std::string, std::string>("", after),
-            std::make_pair<std::string, std::string>("split$cold0", split0)});
+            std::make_pair<std::string, std::string>("split$cold0", split0)},
+           {specific_type_cls});
   ASSERT_TRUE(res);
 }
 
@@ -842,7 +858,7 @@ TEST_F(MethodSplitterTest, SplitTypeDemands) {
 TEST_F(MethodSplitterTest, SplitTypeDemandsRegression) {
   ClassCreator cc{DexType::make_type("LSpecificType;")};
   cc.set_super(type::java_lang_Object());
-  cc.create();
+  auto* specific_type_cls = cc.create();
 
   const auto* before = R"(
     (
@@ -923,7 +939,8 @@ TEST_F(MethodSplitterTest, SplitTypeDemandsRegression) {
            before,
            config,
            {std::make_pair<std::string, std::string>("", after),
-            std::make_pair<std::string, std::string>("split$cold0", split0)});
+            std::make_pair<std::string, std::string>("split$cold0", split0)},
+           {specific_type_cls});
   ASSERT_TRUE(res);
 }
 
@@ -945,9 +962,32 @@ TEST_F(MethodSplitterTest, DontSplitLoadParamChains) {
   auto [cls, m] = create("(IIIIIIIIII)I", code_str);
   m->get_code()->build_cfg();
   auto config = defaultConfig();
-  method_splitting_impl::discover_closures(
-      m, method_splitting_impl::reduce_cfg(m, config.split_block_size));
+  method_splitting_impl::normalize_cfg_for_splitting(m,
+                                                     config.split_block_size);
+  const auto reduced = method_splitting_impl::reduce_cfg(m);
+  method_splitting_impl::discover_closures(m, reduced);
   ASSERT_EQ(m->get_code()->cfg().blocks().size(), 1);
+  m->get_code()->clear_cfg();
+}
+
+TEST_F(MethodSplitterTest, NormalizeTransitiveEmptyBlocksBeforeReturn) {
+  auto [cls, m] = create("()V", "((return-void))");
+  m->get_code()->build_cfg();
+  auto& cfg = m->get_code()->cfg();
+  auto* return_block = cfg.entry_block();
+  auto* entry_block = cfg.create_block();
+  auto* empty_block = cfg.create_block();
+  cfg.set_entry_block(entry_block);
+  cfg.add_edge(entry_block, empty_block, cfg::EDGE_GOTO);
+  cfg.add_edge(empty_block, return_block, cfg::EDGE_GOTO);
+
+  method_splitting_impl::normalize_cfg_for_splitting(m);
+
+  ASSERT_EQ(cfg.num_blocks(), 1);
+  auto first_insn = cfg.entry_block()->get_first_insn();
+  ASSERT_NE(first_insn, cfg.entry_block()->end());
+  EXPECT_EQ(first_insn->insn->opcode(), OPCODE_RETURN_VOID);
+  method_splitting_impl::reduce_cfg(m);
   m->get_code()->clear_cfg();
 }
 
@@ -970,7 +1010,8 @@ TEST_F(MethodSplitterTest, DuplicateSourceBlocksWithReturn) {
       source_blocks::insert_source_blocks(m, &m->get_code()->cfg(), profile,
                                           /*serialize=*/true);
   auto config = defaultConfig();
-  method_splitting_impl::reduce_cfg(m, config.split_block_size);
+  method_splitting_impl::normalize_cfg_for_splitting(m,
+                                                     config.split_block_size);
   auto blocks = m->get_code()->cfg().blocks();
   ASSERT_TRUE(blocks.size() >= 3);
   auto source_blocks = source_blocks::gather_source_blocks(blocks[1]);

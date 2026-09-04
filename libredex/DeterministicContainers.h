@@ -108,13 +108,143 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
 #include <numeric>
+#include <random>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "TemplateUtil.h"
+
+// Redex must produce bit-for-bit reproducible APKs: reproducible builds, build
+// caching, and verifiable releases all rely on the same input always yielding
+// the same output. Iterating a hash container in its incidental order is a
+// silent way to break that -- the output can then change from one run to the
+// next for no visible reason, surfacing later as a flaky build or a cache miss.
+//
+// The Unordered* wrappers already force such iteration to be spelled out (via
+// UnorderedIterable) so it gets reviewed, but they cannot verify the reviewer's
+// "order doesn't matter here" judgment. With REDEX_PERTURB_UNORDERED on
+// (CI/debug only), we deliberately scramble that order per container per run,
+// so any code that still depends on it diverges and is caught by Redex's
+// reproducibility signals in CI -- before it ships. Off by default =>
+// byte-identical, zero-cost.
+#ifndef REDEX_PERTURB_UNORDERED
+#define REDEX_PERTURB_UNORDERED 0
+#endif
+inline constexpr bool kPerturbUnordered = REDEX_PERTURB_UNORDERED;
+
+namespace det_perturb {
+inline uint64_t splitmix64(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+// The base seed for a thread's salt counter. When REDEX_PERTURB_SEED is set it
+// is used verbatim (strtoull base 0 accepts decimal and 0x-hex) AND the
+// thread-id is deliberately dropped, so a single-threaded run reproduces an
+// identical salt stream. Otherwise every thread seeds from random_device XOR
+// its thread-id for per-run, per-thread variation. Note: even with a fixed seed
+// a full run is only best-effort reproducible -- pointer-keyed containers hash
+// raw addresses (ASLR/allocator) and parallel walkers draw salts in a
+// nondeterministic order. The seed's real value is detection variety plus
+// partial, value-keyed reproducibility.
+inline uint64_t perturb_base_seed() {
+  if (const char* env = std::getenv("REDEX_PERTURB_SEED")) {
+    // strtoull returns 0 for unparseable input and does not distinguish that
+    // from a literal "0", so a typo would silently pin every thread to seed 0
+    // -- a reproducible run that is not the one asked for, which is worse than
+    // no seed at all for the debugging this exists to serve. Require the whole
+    // string to parse, and say so loudly otherwise rather than guessing.
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 0);
+    const bool ok =
+        *env != '\0' && end != nullptr && *end == '\0' && errno == 0;
+    if (ok) {
+      return static_cast<uint64_t>(parsed);
+    }
+    fprintf(
+        stderr,
+        "[redex] WARNING: REDEX_PERTURB_SEED=\"%s\" is not a valid integer; "
+        "ignoring it and seeding randomly. Runs will NOT be reproducible.\n",
+        env);
+  }
+  return std::random_device{}() ^
+         static_cast<uint64_t>(
+             std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+// Per-container salt from a thread_local splitmix64 counter (~0.7ns/draw, no
+// large RNG state). Only ever called when perturbation is enabled.
+inline uint64_t new_salt() {
+  // The per-thread counter is intentional: an inline function's thread_local
+  // has one instance per thread across all TUs ([dcl.fct.spec]), which is
+  // exactly the reproducible per-thread salt stream we want.
+  // NOLINTNEXTLINE(facebook-hte-InlinedStaticLocalVariableWarning)
+  thread_local uint64_t state = perturb_base_seed();
+  state += 0x9e3779b97f4a7c15ULL;
+  return splitmix64(state);
+}
+
+} // namespace det_perturb
+
+// A hasher that salts and avalanche-mixes the underlying hash. The salt is
+// drawn once at construction and is read-only afterwards, so it is safe to hash
+// on any thread. operator() MUST be noexcept: libstdc++ caches hash codes for
+// non-noexcept hashers, and a code cached under one container's salt would make
+// cross-container operator== (which re-buckets into the other container)
+// spuriously report inequality.
+template <class Hash>
+struct PerturbHasher {
+  Hash base{};
+  uint64_t salt{det_perturb::new_salt()};
+
+  PerturbHasher() = default;
+  // Implicit so the wrappers' (bucket_count, const Hash&) ctors keep compiling
+  // when EffectiveHash_t<Hash> resolves to PerturbHasher<Hash>.
+  // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+  /* implicit */ PerturbHasher(const Hash& h) : base(h) {}
+
+  // The noexcept below is UNCONDITIONAL, deliberately, even though `base(k)`
+  // is not noexcept for every Hash: `boost::hash<...>` and some hand-written
+  // ones (e.g. `keep_reason::ReasonPtrHash`) lack the annotation, so a throwing
+  // base hasher would std::terminate here rather than propagate.
+  //
+  // Accepted rather than fixed, having tried both alternatives:
+  //   - Propagating instead, via `noexcept(noexcept(base(k)))`, makes
+  //     PerturbHasher non-noexcept for exactly those hashers, which re-enables
+  //     the libstdc++ hash-code caching described above and with it the
+  //     cross-container operator== bug. That trades a theoretical terminate for
+  //     a real wrong-answer bug.
+  //   - Demanding noexcept via static_assert does not compile: it fires on the
+  //     boost hashers, which are third-party and not ours to annotate.
+  //
+  // Safe in practice: the hashers concerned hash pointers and integers and
+  // cannot throw, they merely lack the annotation. And this code only exists in
+  // perturbed builds, which are debug/CI tools that never ship.
+  template <class K>
+  size_t operator()(const K& k) const noexcept {
+    return static_cast<size_t>(
+        det_perturb::splitmix64(static_cast<uint64_t>(base(k)) ^ salt));
+  }
+};
+
+// The hasher actually installed in the underlying std::unordered_* container:
+// the plain Hash in normal builds, its salted form when perturbation is on.
+template <class Hash>
+using EffectiveHash_t =
+    std::conditional_t<kPerturbUnordered, PerturbHasher<Hash>, Hash>;
 
 template <class UnorderedDerived>
 class UnorderedBase {};
@@ -124,7 +254,7 @@ template <class Key,
           class Hash = std::hash<Key>,
           class KeyEqual = std::equal_to<Key>>
 class UnorderedMap : UnorderedBase<UnorderedMap<Key, Value, Hash, KeyEqual>> {
-  using Type = std::unordered_map<Key, Value, Hash, KeyEqual>;
+  using Type = std::unordered_map<Key, Value, EffectiveHash_t<Hash>, KeyEqual>;
   Type m_data;
 
  public:
@@ -133,8 +263,8 @@ class UnorderedMap : UnorderedBase<UnorderedMap<Key, Value, Hash, KeyEqual>> {
   using value_type = typename Type::value_type;
   using size_type = typename Type::size_type;
   using difference_type = typename Type::difference_type;
-  using hasher = typename Type::hasher;
-  using key_equal = typename Type::key_equal;
+  using hasher = Hash;
+  using key_equal = KeyEqual;
   using reference = typename Type::reference;
   using const_reference = typename Type::const_reference;
   using pointer = typename Type::pointer;
@@ -167,6 +297,14 @@ class UnorderedMap : UnorderedBase<UnorderedMap<Key, Value, Hash, KeyEqual>> {
 
     explicit ConstFixedIterator(typename Type::const_iterator entry)
         : m_entry(entry) {}
+
+    // Allows a mutable end()/find() FixedIterator to be used where a
+    // ConstFixedIterator is expected (e.g. as a hint to insert), mirroring the
+    // STL's mutable-to-const iterator conversion. Intentionally non-explicit,
+    // and intentionally one-directional (no const-to-mutable conversion).
+    // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+    /* implicit */ ConstFixedIterator(const FixedIterator& other)
+        : m_entry(other._internal_unsafe_unwrap()) {}
 
     typename Type::const_iterator _internal_unsafe_unwrap() const {
       return m_entry;
@@ -326,15 +464,14 @@ class UnorderedMap : UnorderedBase<UnorderedMap<Key, Value, Hash, KeyEqual>> {
     return FixedIterator(it);
   }
 
-  std::pair<FixedIterator, bool> insert(ConstFixedIterator hint,
-                                        std::pair<Key, Value>&& value) {
+  FixedIterator insert(ConstFixedIterator hint, std::pair<Key, Value>&& value) {
     auto it = m_data.insert(hint._internal_unsafe_unwrap(),
                             std::forward<std::pair<Key, Value>>(value));
     return FixedIterator(it);
   }
 
   template <typename P>
-  std::pair<FixedIterator, bool> insert(ConstFixedIterator hint, P&& value) {
+  FixedIterator insert(ConstFixedIterator hint, P&& value) {
     auto it =
         m_data.insert(hint._internal_unsafe_unwrap(), std::forward<P>(value));
     return FixedIterator(it);
@@ -345,9 +482,7 @@ class UnorderedMap : UnorderedBase<UnorderedMap<Key, Value, Hash, KeyEqual>> {
     m_data.insert(first, last);
   }
 
-  void insert(std::initializer_list<std::pair<Key, Value>> ilist) {
-    m_data.insert(ilist);
-  }
+  void insert(std::initializer_list<value_type> ilist) { m_data.insert(ilist); }
 
   Value& operator[](const Key& key) { return m_data[key]; }
 
@@ -438,7 +573,8 @@ template <class Key,
           class KeyEqual = std::equal_to<Key>>
 class UnorderedMultiMap
     : UnorderedBase<UnorderedMultiMap<Key, Value, Hash, KeyEqual>> {
-  using Type = std::unordered_multimap<Key, Value, Hash, KeyEqual>;
+  using Type =
+      std::unordered_multimap<Key, Value, EffectiveHash_t<Hash>, KeyEqual>;
   Type m_data;
 
  public:
@@ -447,8 +583,8 @@ class UnorderedMultiMap
   using value_type = typename Type::value_type;
   using size_type = typename Type::size_type;
   using difference_type = typename Type::difference_type;
-  using hasher = typename Type::hasher;
-  using key_equal = typename Type::key_equal;
+  using hasher = Hash;
+  using key_equal = KeyEqual;
   using reference = typename Type::reference;
   using const_reference = typename Type::const_reference;
   using pointer = typename Type::pointer;
@@ -481,6 +617,14 @@ class UnorderedMultiMap
 
     explicit ConstFixedIterator(typename Type::const_iterator entry)
         : m_entry(entry) {}
+
+    // Allows a mutable end()/find() FixedIterator to be used where a
+    // ConstFixedIterator is expected (e.g. as a hint to insert), mirroring the
+    // STL's mutable-to-const iterator conversion. Intentionally non-explicit,
+    // and intentionally one-directional (no const-to-mutable conversion).
+    // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+    /* implicit */ ConstFixedIterator(const FixedIterator& other)
+        : m_entry(other._internal_unsafe_unwrap()) {}
 
     typename Type::const_iterator _internal_unsafe_unwrap() const {
       return m_entry;
@@ -649,9 +793,7 @@ class UnorderedMultiMap
     m_data.insert(first, last);
   }
 
-  void insert(std::initializer_list<std::pair<Key, Value>> ilist) {
-    m_data.insert(ilist);
-  }
+  void insert(std::initializer_list<value_type> ilist) { m_data.insert(ilist); }
 
   FixedIterator _internal_unordered_any() {
     return FixedIterator(m_data.begin());
@@ -711,6 +853,18 @@ class UnorderedMultiMap
 
   bool empty() const { return m_data.empty(); }
 
+  // Not perturbed: the order ACROSS keys is already perturbed by the salted
+  // EffectiveHash_t, but the order of values WITHIN one key's equal_range is
+  // left in insertion order.
+  //
+  // This is a deliberate limitation rather than an oversight, so it is stated
+  // here rather than tracked as work to do. Perturbing the within-key order
+  // would require this pair-of-iterators contract to become an owning range
+  // holding a shuffled buffer -- a bare iterator pair owns nothing, so
+  // iterators into a temporary buffer would dangle -- which is a
+  // caller-visible API change. Intra-equal-key-group order dependence is rare
+  // and UnorderedMultiMap is itself uncommon, so the payoff does not justify
+  // that churn. Revisit if a real divergence is ever traced to this gap.
   std::pair<typename Type::const_iterator, typename Type::const_iterator>
   _internal_unordered_equal_range(const Key& key) const {
     return m_data.equal_range(key);
@@ -751,12 +905,122 @@ bool operator!=(const UnorderedMultiMap<Key, Value, Hash, KeyEqual>& lhs,
   return lhs._internal_unsafe_unwrap() != rhs._internal_unsafe_unwrap();
 }
 
+// A forward-only iterator over an UnorderedBag's elements. A bag's iteration
+// order carries no meaning, so its view deliberately exposes only forward
+// traversal (no random access), in both build modes: code that would depend on
+// element position fails to compile everywhere rather than only under
+// perturbation in CI. When perturbation is off it is a zero-cost pass-through
+// that holds and advances the real vector iterator, so ++/*/== compile to
+// exactly the same code as iterating the backing vector directly. When on it
+// walks the range [base, base + n) from a salted offset and wraps around,
+// visiting every element exactly once but in a rotated order (a bag is a
+// std::vector, so it has no hasher to salt like the hash-based wrappers).
+//
+// Forward-only is sufficient: no bag consumer needs random access -- min/max/
+// find/copy/accumulate are all single-pass, and callers that sort go through
+// unordered_to_ordered, which copies into a fresh vector first.
+template <class VecIter>
+class BagViewIterator {
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = typename std::iterator_traits<VecIter>::value_type;
+  using difference_type =
+      typename std::iterator_traits<VecIter>::difference_type;
+  using pointer = typename std::iterator_traits<VecIter>::pointer;
+  using reference = typename std::iterator_traits<VecIter>::reference;
+
+  BagViewIterator() = default;
+
+#if REDEX_PERTURB_UNORDERED
+  BagViewIterator(VecIter base, size_t n, size_t off, size_t pos)
+      : m_base(base), m_n(n), m_off(off), m_pos(pos) {}
+
+  reference operator*() const { return *underlying(); }
+  pointer operator->() const { return &*underlying(); }
+
+  BagViewIterator& operator++() {
+    ++m_pos;
+    return *this;
+  }
+  BagViewIterator operator++(int) {
+    BagViewIterator tmp = *this;
+    ++m_pos;
+    return tmp;
+  }
+
+  bool operator==(const BagViewIterator& other) const {
+    return m_pos == other.m_pos;
+  }
+  bool operator!=(const BagViewIterator& other) const {
+    return m_pos != other.m_pos;
+  }
+
+  // The real range iterator for the current logical position. A past-the-end
+  // position maps to base + n (the range's real end()), so a not-found result
+  // maps back to the container's end().
+  VecIter underlying() const {
+    size_t phys = m_pos >= m_n ? m_n : (m_off + m_pos) % m_n;
+    return m_base + static_cast<difference_type>(phys);
+  }
+
+ private:
+  VecIter m_base{};
+  size_t m_n{0};
+  size_t m_off{0};
+  size_t m_pos{0};
+#else
+  explicit BagViewIterator(VecIter it) : m_it(it) {}
+
+  reference operator*() const { return *m_it; }
+  pointer operator->() const { return &*m_it; }
+
+  BagViewIterator& operator++() {
+    ++m_it;
+    return *this;
+  }
+  BagViewIterator operator++(int) {
+    BagViewIterator tmp = *this;
+    ++m_it;
+    return tmp;
+  }
+
+  bool operator==(const BagViewIterator& other) const {
+    return m_it == other.m_it;
+  }
+  bool operator!=(const BagViewIterator& other) const {
+    return m_it != other.m_it;
+  }
+
+  // The underlying vector iterator for the current position, used to map a view
+  // iterator back to a (non-steppable) FixedIterator.
+  VecIter underlying() const { return m_it; }
+
+ private:
+  VecIter m_it{};
+#endif
+};
+
+template <class T>
+struct is_bag_view_iterator : std::false_type {};
+template <class VecIter>
+struct is_bag_view_iterator<BagViewIterator<VecIter>> : std::true_type {};
+template <class T>
+inline constexpr bool is_bag_view_iterator_v = is_bag_view_iterator<T>::value;
+
 class UnorderedBagBase {};
 
 template <class Value>
 class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
   using Type = std::vector<Value>;
   Type m_data;
+#if REDEX_PERTURB_UNORDERED
+  // Per-bag salt for iteration-order perturbation (a bag has no hasher to salt,
+  // unlike the hash-based wrappers). Absent -> byte-identical when off. It
+  // perturbs only iteration order, not the bag's value, so it does not affect
+  // unordered_equal (which compares the raw elements as an order-independent
+  // multiset).
+  uint64_t m_salt{det_perturb::new_salt()};
+#endif
 
  public:
   using key_type = void;
@@ -797,6 +1061,14 @@ class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
     explicit ConstFixedIterator(typename Type::const_iterator entry)
         : m_entry(entry) {}
 
+    // Allows a mutable end()/find() FixedIterator to be used where a
+    // ConstFixedIterator is expected (e.g. as a hint to insert), mirroring the
+    // STL's mutable-to-const iterator conversion. Intentionally non-explicit,
+    // and intentionally one-directional (no const-to-mutable conversion).
+    // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+    /* implicit */ ConstFixedIterator(const FixedIterator& other)
+        : m_entry(other._internal_unsafe_unwrap()) {}
+
     typename Type::const_iterator _internal_unsafe_unwrap() const {
       return m_entry;
     }
@@ -831,45 +1103,94 @@ class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
     typename Type::iterator _internal_unsafe_unwrap() const { return m_entry; }
   };
 
-  // TODO: Make extra non-deterministic in debug builds
   class UnorderedIterable {
     Type& m_data;
+#if REDEX_PERTURB_UNORDERED
+    uint64_t m_salt;
+
+    size_t offset() const {
+      size_t n = m_data.size();
+      return n == 0 ? 0 : m_salt % n;
+    }
+#endif
 
    public:
-    using iterator = typename Type::iterator;
-    using const_iterator = typename Type::const_iterator;
+    using iterator = BagViewIterator<typename Type::iterator>;
+    using const_iterator = BagViewIterator<typename Type::const_iterator>;
 
+#if REDEX_PERTURB_UNORDERED
+    UnorderedIterable(Type& data, uint64_t salt) : m_data(data), m_salt(salt) {}
+
+    iterator begin() {
+      return iterator(m_data.begin(), m_data.size(), offset(), 0);
+    }
+    iterator end() {
+      return iterator(m_data.begin(), m_data.size(), offset(), m_data.size());
+    }
+    const_iterator begin() const {
+      return const_iterator(m_data.cbegin(), m_data.size(), offset(), 0);
+    }
+    const_iterator end() const {
+      return const_iterator(m_data.cbegin(), m_data.size(), offset(),
+                            m_data.size());
+    }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend() const { return end(); }
+#else
     explicit UnorderedIterable(Type& data) : m_data(data) {}
 
-    iterator begin() { return m_data.begin(); }
+    iterator begin() { return iterator(m_data.begin()); }
 
-    iterator end() { return m_data.end(); }
+    iterator end() { return iterator(m_data.end()); }
 
-    const_iterator begin() const { return m_data.begin(); }
+    const_iterator begin() const { return const_iterator(m_data.cbegin()); }
 
-    const_iterator end() const { return m_data.end(); }
+    const_iterator end() const { return const_iterator(m_data.cend()); }
 
-    const_iterator cbegin() const { return m_data.cbegin(); }
+    const_iterator cbegin() const { return const_iterator(m_data.cbegin()); }
 
-    const_iterator cend() const { return m_data.cend(); }
+    const_iterator cend() const { return const_iterator(m_data.cend()); }
+#endif
   };
 
-  // TODO: Make extra non-deterministic in debug builds
   class ConstUnorderedIterable {
     const Type& m_data;
+#if REDEX_PERTURB_UNORDERED
+    uint64_t m_salt;
+
+    size_t offset() const {
+      size_t n = m_data.size();
+      return n == 0 ? 0 : m_salt % n;
+    }
+#endif
 
    public:
-    using const_iterator = typename Type::const_iterator;
+    using const_iterator = BagViewIterator<typename Type::const_iterator>;
 
+#if REDEX_PERTURB_UNORDERED
+    ConstUnorderedIterable(const Type& data, uint64_t salt)
+        : m_data(data), m_salt(salt) {}
+
+    const_iterator begin() const {
+      return const_iterator(m_data.begin(), m_data.size(), offset(), 0);
+    }
+    const_iterator end() const {
+      return const_iterator(m_data.begin(), m_data.size(), offset(),
+                            m_data.size());
+    }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend() const { return end(); }
+#else
     explicit ConstUnorderedIterable(const Type& data) : m_data(data) {}
 
-    const_iterator begin() const { return m_data.begin(); }
+    const_iterator begin() const { return const_iterator(m_data.begin()); }
 
-    const_iterator end() const { return m_data.end(); }
+    const_iterator end() const { return const_iterator(m_data.end()); }
 
-    const_iterator cbegin() const { return m_data.cbegin(); }
+    const_iterator cbegin() const { return const_iterator(m_data.cbegin()); }
 
-    const_iterator cend() const { return m_data.cend(); }
+    const_iterator cend() const { return const_iterator(m_data.cend()); }
+#endif
   };
 
   UnorderedBag() : m_data() {}
@@ -913,10 +1234,22 @@ class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
   }
 
   FixedIterator _internal_unordered_any() {
+#if REDEX_PERTURB_UNORDERED
+    if (!m_data.empty()) {
+      return FixedIterator(m_data.begin() + static_cast<difference_type>(
+                                                m_salt % m_data.size()));
+    }
+#endif
     return FixedIterator(m_data.begin());
   }
 
   ConstFixedIterator _internal_unordered_any() const {
+#if REDEX_PERTURB_UNORDERED
+    if (!m_data.empty()) {
+      return ConstFixedIterator(m_data.begin() + static_cast<difference_type>(
+                                                     m_salt % m_data.size()));
+    }
+#endif
     return ConstFixedIterator(m_data.begin());
   }
 
@@ -939,17 +1272,35 @@ class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
   bool empty() const { return m_data.empty(); }
 
   UnorderedIterable _internal_unordered_iterable() {
+#if REDEX_PERTURB_UNORDERED
+    return UnorderedIterable(m_data, m_salt);
+#else
     return UnorderedIterable(m_data);
+#endif
   }
 
   ConstUnorderedIterable _internal_unordered_iterable() const {
+#if REDEX_PERTURB_UNORDERED
+    return ConstUnorderedIterable(m_data, m_salt);
+#else
     return ConstUnorderedIterable(m_data);
+#endif
   }
 
   template <typename possibly_const_iterator>
   auto _internal_to_fixed_iterator(possibly_const_iterator it) const {
-    if constexpr (std::is_same_v<possibly_const_iterator,
-                                 typename Type::const_iterator>) {
+    if constexpr (is_bag_view_iterator_v<possibly_const_iterator>) {
+      // A bag view yields BagViewIterators; map back to the real vector
+      // iterator before building the (non-steppable) FixedIterator.
+      auto entry = it.underlying();
+      if constexpr (std::is_same_v<decltype(entry),
+                                   typename Type::const_iterator>) {
+        return ConstFixedIterator(entry);
+      } else {
+        return FixedIterator(entry);
+      }
+    } else if constexpr (std::is_same_v<possibly_const_iterator,
+                                        typename Type::const_iterator>) {
       return ConstFixedIterator(it);
     } else {
       return FixedIterator(it);
@@ -961,23 +1312,19 @@ class UnorderedBag : UnorderedBase<UnorderedBag<Value>>, UnorderedBagBase {
   Type& _internal_unsafe_unwrap() { return m_data; }
 };
 
-template <class Value>
-bool operator==(const UnorderedBag<Value>& lhs,
-                const UnorderedBag<Value>& rhs) {
-  return lhs._internal_unsafe_unwrap() == rhs._internal_unsafe_unwrap();
-}
-
-template <class Value>
-bool operator!=(const UnorderedBag<Value>& lhs,
-                const UnorderedBag<Value>& rhs) {
-  return lhs._internal_unsafe_unwrap() != rhs._internal_unsafe_unwrap();
-}
+// UnorderedBag intentionally provides no operator==/operator!=. A bag's element
+// order is non-deterministic, so sequence equality (delegating to the backing
+// std::vector) would depend on that order, and there is no meaningful
+// order-independent default. Callers that need to compare bags must pick
+// explicit semantics (e.g. compare unordered_to_ordered(...) results, or pass a
+// custom order-independent equality to APIs like
+// InsertOnlyConcurrentMap::get_or_create_and_assert_equal).
 
 template <class Key,
           class Hash = std::hash<Key>,
           class KeyEqual = std::equal_to<Key>>
 class UnorderedSet : UnorderedBase<UnorderedSet<Key, Hash, KeyEqual>> {
-  using Type = std::unordered_set<Key, Hash, KeyEqual>;
+  using Type = std::unordered_set<Key, EffectiveHash_t<Hash>, KeyEqual>;
   Type m_data;
 
  public:
@@ -985,8 +1332,8 @@ class UnorderedSet : UnorderedBase<UnorderedSet<Key, Hash, KeyEqual>> {
   using value_type = typename Type::value_type;
   using size_type = typename Type::size_type;
   using difference_type = typename Type::difference_type;
-  using hasher = typename Type::hasher;
-  using key_equal = typename Type::key_equal;
+  using hasher = Hash;
+  using key_equal = KeyEqual;
   using reference = typename Type::reference;
   using const_reference = typename Type::const_reference;
   using pointer = typename Type::pointer;
@@ -1019,6 +1366,14 @@ class UnorderedSet : UnorderedBase<UnorderedSet<Key, Hash, KeyEqual>> {
 
     explicit ConstFixedIterator(typename Type::const_iterator entry)
         : m_entry(entry) {}
+
+    // Allows a mutable end()/find() FixedIterator to be used where a
+    // ConstFixedIterator is expected (e.g. as a hint to insert), mirroring the
+    // STL's mutable-to-const iterator conversion. Intentionally non-explicit,
+    // and intentionally one-directional (no const-to-mutable conversion).
+    // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+    /* implicit */ ConstFixedIterator(const FixedIterator& other)
+        : m_entry(other._internal_unsafe_unwrap()) {}
 
     typename Type::const_iterator _internal_unsafe_unwrap() const {
       return m_entry;
@@ -1204,6 +1559,8 @@ class UnorderedSet : UnorderedBase<UnorderedSet<Key, Hash, KeyEqual>> {
 
   size_t count(const Key& key) const { return m_data.count(key); }
 
+  bool contains(const Key& key) const { return m_data.count(key) != 0; }
+
   void reserve(size_t size) { m_data.reserve(size); }
 
   size_t size() const { return m_data.size(); }
@@ -1277,6 +1634,20 @@ auto unordered_any(const Collection& collection) {
   return collection.begin();
 }
 
+// Reject rvalues: an iterator into a temporary would dangle once the enclosing
+// full-expression ends. Callers must bind the collection to a variable first.
+// (Safe inline uses such as `*unordered_any(x)` where x is an lvalue are
+// unaffected, as they select the lvalue overloads above.)
+template <class Collection, bool skip_assert = false>
+auto unordered_any(Collection&& collection) {
+  static_assert(skip_assert,
+                "unordered_any from an rvalue collection would return an "
+                "iterator into a destroyed temporary; store the collection in "
+                "a variable first.");
+  // Only present so that a return type can be inferred; never reached.
+  return collection.end();
+}
+
 template <class UnorderedCollection,
           std::enable_if_t<std::is_base_of_v<UnorderedBase<UnorderedCollection>,
                                              UnorderedCollection>,
@@ -1299,11 +1670,12 @@ template <class UnorderedCollection,
                            bool> = true,
           bool skip_assert = false>
 auto UnorderedIterable(UnorderedCollection&& collection) {
-  // This templated function get selected in an expression like the following:
-  // for (auto x : UnorderedIterable(new UnorderedMap(...))) { ... }
-  // However, the temporary collection may get destroyed before the end of the
-  // loop. We want to avoid that, as the UnorderedIterable() only captures a
-  // reference to the collection.
+  // This templated function gets selected in an expression like the following,
+  // where the argument is a temporary (an rvalue) collection:
+  // for (auto x : UnorderedIterable(make_unordered_map())) { ... }
+  // The temporary collection may get destroyed before the end of the loop. We
+  // want to avoid that, as the UnorderedIterable() only captures a reference to
+  // the collection.
   static_assert(
       skip_assert,
       "Creating an UnorderedIterable from an rvalue is not implemented. Store "
@@ -1328,6 +1700,24 @@ template <
     std::enable_if_t<!std::is_base_of_v<UnorderedBase<Collection>, Collection>,
                      bool> = true>
 const Collection& UnorderedIterable(const Collection& collection) {
+  return collection;
+}
+
+// Reject rvalues of ordinary (non-wrapper) collections too: returning a
+// reference to a temporary would dangle (the wrapper overload above already
+// rejects wrapper rvalues). The !is_base_of constraint keeps this disjoint from
+// that wrapper rvalue overload so the two never overlap.
+template <
+    class Collection,
+    std::enable_if_t<!std::is_base_of_v<UnorderedBase<Collection>, Collection>,
+                     bool> = true,
+    bool skip_assert = false>
+Collection& UnorderedIterable(Collection&& collection) {
+  static_assert(skip_assert,
+                "Creating an UnorderedIterable from an rvalue ordinary "
+                "collection would return a reference to a destroyed temporary; "
+                "store the collection in a variable first.");
+  // Only present so that a return type can be inferred; never reached.
   return collection;
 }
 
@@ -1429,6 +1819,13 @@ template <class Collection,
                                std::is_base_of_v<UnorderedBagBase, Collection>,
                            bool> = true>
 std::vector<Value> unordered_to_ordered(Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<Value>,
+      "unordered_to_ordered on a collection of raw pointers would order by "
+      "address, which is non-deterministic across runs; pass an explicit "
+      "comparator (e.g. compare_dexmethods) to the two-argument overload. Note "
+      "this guard only catches raw pointers, not smart pointers or "
+      "pointer-containing pairs/tuples.");
   std::vector<Value> result;
   result.reserve(collection.size());
   for (auto& entry : UnorderedIterable(collection)) {
@@ -1460,6 +1857,12 @@ template <
     class Collection,
     class Key = typename std::remove_const<typename Collection::key_type>::type>
 std::vector<Key> unordered_to_ordered_keys(Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<Key>,
+      "unordered_to_ordered_keys on raw pointer keys would order by address, "
+      "which is non-deterministic across runs; pass an explicit comparator to "
+      "the two-argument overload. Note this guard only catches raw pointers, "
+      "not smart pointers or pointer-containing pairs/tuples.");
   std::vector<Key> result;
   result.reserve(collection.size());
   for (auto& entry : UnorderedIterable(collection)) {
@@ -1530,8 +1933,7 @@ bool unordered_none_of(const Collection& collection, UnaryPred p) {
 template <class Collection, class UnaryFunc>
 UnaryFunc unordered_for_each(const Collection& collection, UnaryFunc f) {
   auto&& ui = UnorderedIterable(collection);
-  std::for_each(ui.begin(), ui.end(), std::move(f));
-  return f;
+  return std::for_each(ui.begin(), ui.end(), std::move(f));
 }
 
 template <class Collection, class OutputIt>
@@ -1630,6 +2032,11 @@ typename Collection::difference_type unordered_count_if(
 
 template <class Collection>
 auto unordered_min_element(Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<typename Collection::value_type>,
+      "unordered_min_element on raw pointers selects by address, which is "
+      "non-deterministic across runs; pass an explicit comparator to the "
+      "overload that takes one.");
   auto&& ui = UnorderedIterable(collection);
   return unordered_to_fixed_iterator(collection,
                                      std::min_element(ui.begin(), ui.end()));
@@ -1637,6 +2044,11 @@ auto unordered_min_element(Collection& collection) {
 
 template <class Collection>
 auto unordered_min_element(const Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<typename Collection::value_type>,
+      "unordered_min_element on raw pointers selects by address, which is "
+      "non-deterministic across runs; pass an explicit comparator to the "
+      "overload that takes one.");
   auto&& ui = UnorderedIterable(collection);
   return unordered_to_fixed_iterator(collection,
                                      std::min_element(ui.begin(), ui.end()));
@@ -1674,6 +2086,11 @@ auto unordered_min_element(Collection&& collection, Compare) {
 
 template <class Collection>
 auto unordered_max_element(Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<typename Collection::value_type>,
+      "unordered_max_element on raw pointers selects by address, which is "
+      "non-deterministic across runs; pass an explicit comparator to the "
+      "overload that takes one.");
   auto&& ui = UnorderedIterable(collection);
   return unordered_to_fixed_iterator(collection,
                                      std::max_element(ui.begin(), ui.end()));
@@ -1681,6 +2098,11 @@ auto unordered_max_element(Collection& collection) {
 
 template <class Collection>
 auto unordered_max_element(const Collection& collection) {
+  static_assert(
+      !std::is_pointer_v<typename Collection::value_type>,
+      "unordered_max_element on raw pointers selects by address, which is "
+      "non-deterministic across runs; pass an explicit comparator to the "
+      "overload that takes one.");
   auto&& ui = UnorderedIterable(collection);
   return unordered_to_fixed_iterator(collection,
                                      std::max_element(ui.begin(), ui.end()));
@@ -1778,5 +2200,74 @@ template <class Collection>
 struct UnorderedMergeContainers {
   void operator()(const Collection& addend, Collection* accumulator) {
     insert_unordered_iterable(*accumulator, addend);
+  }
+};
+
+// Order-independent (multiset) equality of two unordered collections of the
+// same type: they are equal iff they hold the same elements with the same
+// multiplicities, regardless of iteration order. Use this instead of `==` when
+// comparing collections whose element order is non-deterministic (e.g.
+// UnorderedBag, or the mapped values of a concurrent map).
+//
+// Default (hashing) form, O(n):
+//  - For associative Unordered wrappers (UnorderedSet/UnorderedMap/
+//    UnorderedMultiMap), whose own `operator==` is already order-independent,
+//    this delegates to it (so it also works for maps, whose element type isn't
+//    hashable).
+//  - Otherwise (UnorderedBag, or a plain hashable sequence), it compares
+//  element
+//    multiplicities via a hash map, so it requires the element type to be
+//    hashable and equality-comparable (pointers, ints, strings, ...). For
+//    interned pointers (e.g. DexMethod*) this is pointer identity.
+template <class Collection>
+bool unordered_equal(const Collection& a, const Collection& b) {
+  if constexpr (std::is_base_of_v<UnorderedBase<Collection>, Collection> &&
+                !std::is_base_of_v<UnorderedBagBase, Collection>) {
+    return a == b;
+  } else {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    UnorderedMap<typename Collection::value_type, size_t> counts;
+    counts.reserve(a.size());
+    for (const auto& x : UnorderedIterable(a)) {
+      ++counts[x];
+    }
+    for (const auto& x : UnorderedIterable(b)) {
+      auto it = counts.find(x);
+      if (it == counts.end() || it->second == 0) {
+        return false;
+      }
+      --it->second;
+    }
+    return true;
+  }
+}
+
+// Comparator form, O(n log n): for element types that are orderable but not
+// hashable, or when a specific canonical order is wanted. `comp` is a strict
+// weak ordering over elements.
+template <class Collection, class Compare>
+bool unordered_equal(const Collection& a, const Collection& b, Compare comp) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  return unordered_to_ordered(a, comp) == unordered_to_ordered(b, comp);
+}
+
+// Default-constructible functor form of `unordered_equal`, for APIs that take
+// an equality *type* rather than a callable -- e.g. the `ValueEqual` template
+// parameter of `InsertOnlyConcurrentMap::get_or_create_and_assert_equal` when
+// the mapped value is an unordered collection. `Compare = void` selects the
+// hashing form; otherwise a default-constructed `Compare` selects the
+// comparator form.
+template <class Collection, class Compare = void>
+struct UnorderedEqual {
+  bool operator()(const Collection& a, const Collection& b) const {
+    if constexpr (std::is_void_v<Compare>) {
+      return unordered_equal(a, b);
+    } else {
+      return unordered_equal(a, b, Compare());
+    }
   }
 };

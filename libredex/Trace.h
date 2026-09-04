@@ -24,6 +24,7 @@ class DexType;
   TM(ARGS)                     \
   TM(ARSC)                     \
   TM(ASSESSOR)                 \
+  TM(ATOMUP)                   \
   TM(BBPROFILE)                \
   TM(BBREORDERING)             \
   TM(BIND)                     \
@@ -156,6 +157,7 @@ class DexType;
   TM(STATIC_RELO)              \
   TM(STATS)                    \
   TM(STRBUILD)                 \
+  TM(STRSW)                    \
   TM(STR_CAT)                  \
   TM(SUPER)                    \
   TM(SW)                       \
@@ -171,6 +173,7 @@ class DexType;
   TM(TYPE)                     \
   TM(TYPE_TRANSFORM)           \
   TM(UCM)                      \
+  TM(ULH)                      \
   TM(UNCONDITIONALLY_THROWING) \
   TM(UNREF_INTF)               \
   TM(UNREACHABLE)              \

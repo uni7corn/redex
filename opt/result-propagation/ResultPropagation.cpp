@@ -14,6 +14,7 @@
 
 #include "BaseIRAnalyzer.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
@@ -259,6 +260,19 @@ std::optional<ParamIndex> ReturnParamResolver::get_return_param_index(
 
   ParamDomain param = ParamDomain::bottom();
   if (is_abstract(callee)) {
+    // Some compilers emit `invoke-super` to an abstract method as the body
+    // of a synthetic covariant-return bridge (observed in
+    // org.chromium.net.impl.CronetEngineBase shipped with
+    // play-services-cronet). Such a call, if dispatched at runtime, would
+    // throw AbstractMethodError; here we just bail out conservatively so
+    // the rest of the analysis can proceed. This is sister to the upstream
+    // BridgeSynthInlinePass rewrite that normalizes these bridges to an
+    // explicit throw; this branch remains as a defense in depth in case
+    // that pass hasn't run (it runs after this pass in the default config)
+    // or in case a similar pattern reaches us from elsewhere.
+    if (opcode == OPCODE_INVOKE_SUPER) {
+      return std::nullopt;
+    }
     always_assert(opcode == OPCODE_INVOKE_VIRTUAL ||
                   opcode == OPCODE_INVOKE_INTERFACE);
   } else {
@@ -342,10 +356,8 @@ bool ReturnParamResolver::returns_receiver(const DexMethodRef* method) const {
 
   // these framework classes implement the "Appendable" interface, with the
   // formal return type being the exact class type
-  if (cls == m_char_buffer_type || cls == m_print_stream_type ||
-      cls == m_print_writer_type || cls == m_string_buffer_type ||
-      cls == m_string_builder_type || cls == m_string_writer_type ||
-      cls == m_writer_type) {
+  if (cls == m_char_buffer_type || cls == m_string_buffer_type ||
+      cls == m_string_builder_type) {
     if (method->get_name() == DexString::make_string("append")) {
       always_assert(returns_compatible_with_receiver(method));
       return true;
@@ -372,15 +384,6 @@ bool ReturnParamResolver::returns_receiver(const DexMethodRef* method) const {
         name == DexString::make_string("putInt") ||
         name == DexString::make_string("putLong") ||
         name == DexString::make_string("putShort")) {
-      always_assert(returns_compatible_with_receiver(method));
-      return true;
-    }
-  }
-
-  if (cls == m_print_stream_type || cls == m_print_writer_type) {
-    const auto* name = method->get_name();
-    if (name == DexString::make_string("format") ||
-        name == DexString::make_string("printf")) {
       always_assert(returns_compatible_with_receiver(method));
       return true;
     }

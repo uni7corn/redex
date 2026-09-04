@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <utility>
 #include <vector>
 
 #include <sparta/ConstantAbstractDomain.h>
@@ -15,6 +14,7 @@
 #include "BaseIRAnalyzer.h"
 #include "ConcurrentContainers.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexClass.h"
 #include "IRCode.h"
 #include "IRInstruction.h"

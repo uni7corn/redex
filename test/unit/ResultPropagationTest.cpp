@@ -5,11 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "OptionalIO.h"
 #include <gtest/gtest.h>
 #include <optional>
 
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "IRAssembler.h"
 #include "IRCode.h"
 #include "RedexTest.h"

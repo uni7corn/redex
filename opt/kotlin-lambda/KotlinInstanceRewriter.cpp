@@ -9,6 +9,7 @@
 #include "AtomicStatCounter.h"
 #include "CFGMutation.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "KotlinLambdaAnalyzer.h"
 #include "PassManager.h"
 #include "Show.h"
@@ -191,6 +192,7 @@ KotlinInstanceRewriter::Stats KotlinInstanceRewriter::transform(
       always_assert(init);
       // Make this constructor publcic
       set_public(init->as_def());
+      std::vector<IRInstruction*> init_insns_to_fix;
       auto iterable = cfg::InstructionIterable(cfg);
       for (auto insn_it = iterable.begin(); insn_it != iterable.end();
            insn_it++) {
@@ -216,11 +218,32 @@ KotlinInstanceRewriter::Stats KotlinInstanceRewriter::transform(
           replacement.emplace_back(source_blocks::clone_as_synthetic(sb));
         }
         replacement.emplace_back(init_isn);
+        if (sb != nullptr) {
+          replacement.emplace_back(source_blocks::clone_as_synthetic(sb));
+        }
+        init_insns_to_fix.push_back(init_isn);
         m.replace_mie(insn_it, std::move(replacement));
         m.remove(move_result_it);
         stats.kotlin_new_inserted++;
       }
       m.flush();
+      for (auto* block : cfg.blocks()) {
+        auto last_insn_it = block->get_last_insn();
+        if (last_insn_it == block->end()) {
+          continue;
+        }
+        for (auto* tracked_init : init_insns_to_fix) {
+          if (last_insn_it->insn == tracked_init) {
+            auto* sb_ptr = source_blocks::get_first_source_block(block);
+            if (sb_ptr != nullptr) {
+              source_blocks::impl::BlockAccessor::insert_source_block_after(
+                  block, last_insn_it,
+                  source_blocks::clone_as_synthetic(sb_ptr));
+            }
+            break;
+          }
+        }
+      }
       TRACE(KOTLIN_INSTANCE, 5, "%s after\n%s", SHOW(meth), SHOW(cfg));
     }
     cls->remove_field(resolve_field(field));

@@ -8,13 +8,13 @@
 #include <gtest/gtest.h>
 
 #include "Creators.h"
+#include "Debug.h"
 #include "IRAssembler.h"
 #include "RedexTest.h"
 #include "RemoveUninstantiablesImpl.h"
 #include "ScopeHelper.h"
 #include "SourceBlocks.h"
 #include "TypeUtil.h"
-#include "VirtualScope.h"
 #include "Walkers.h"
 
 namespace {

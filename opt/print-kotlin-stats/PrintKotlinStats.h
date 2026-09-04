@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "AnalysisUsage.h"
 #include "ConcurrentContainers.h"
 #include "DeterministicContainers.h"
@@ -21,10 +23,13 @@ class PrintKotlinStats : public Pass {
  public:
   struct Stats {
     size_t unknown_null_check_insns{0};
-    size_t kotlin_null_check_param_insns{0};
+    size_t kotlin_null_check_param_insns_in_root_method{0};
+    size_t kotlin_null_check_param_insns_in_non_root_method{0};
     size_t kotlin_null_check_expr_insns{0};
     size_t kotlin_null_check_notnull_insns{0};
     size_t kotlin_areequal_insns{0};
+    size_t kotlin_compare_int_insns{0};
+    size_t kotlin_compare_long_insns{0};
     size_t kotlin_default_arg_check_insns{0};
     size_t kotlin_default_arg_1_param{0};
     size_t kotlin_default_arg_2_params{0};
@@ -62,13 +67,33 @@ class PrintKotlinStats : public Pass {
     size_t kotlin_enum_class{0};
     size_t kotlin_trivial_non_capturing_lambdas{0};
     size_t kotlin_unique_trivial_non_capturing_lambdas{0};
+    // Counts of `invoke-interface` to `kotlin.jvm.functions.FunctionN.invoke`
+    // for arities 0..3 and 4+. Index 4 holds the aggregate for arities >= 4.
+    std::array<size_t, 5> kotlin_invoke_interface_function_insns{};
+    // Count of method parameters typed `kotlin.jvm.functions.FunctionN`
+    // (callback / higher-order-function parameter slots), across all arities
+    // including the vararg `FunctionN`. A method declaring several such
+    // parameters contributes once per parameter; only methods with code are
+    // examined.
+    size_t kotlin_lambda_type_method_params{0};
+    // Atomic{Reference,Integer,Long}FieldUpdater usage: number of
+    // `newUpdater(...)` allocations and number of operation call sites
+    // (`get`/`set`/`compareAndSet`/...). Sizes the AtomicFieldUpdater
+    // optimization opportunity.
+    size_t atomic_field_updater_newupdater_insns{0};
+    size_t atomic_field_updater_op_insns{0};
 
     Stats& operator+=(const Stats& that) {
       unknown_null_check_insns += that.unknown_null_check_insns;
-      kotlin_null_check_param_insns += that.kotlin_null_check_param_insns;
+      kotlin_null_check_param_insns_in_root_method +=
+          that.kotlin_null_check_param_insns_in_root_method;
+      kotlin_null_check_param_insns_in_non_root_method +=
+          that.kotlin_null_check_param_insns_in_non_root_method;
       kotlin_null_check_expr_insns += that.kotlin_null_check_expr_insns;
       kotlin_null_check_notnull_insns += that.kotlin_null_check_notnull_insns;
       kotlin_areequal_insns += that.kotlin_areequal_insns;
+      kotlin_compare_int_insns += that.kotlin_compare_int_insns;
+      kotlin_compare_long_insns += that.kotlin_compare_long_insns;
       kotlin_default_arg_check_insns += that.kotlin_default_arg_check_insns;
       kotlin_default_arg_1_param += that.kotlin_default_arg_1_param;
       kotlin_default_arg_2_params += that.kotlin_default_arg_2_params;
@@ -113,6 +138,15 @@ class PrintKotlinStats : public Pass {
           that.kotlin_trivial_non_capturing_lambdas;
       kotlin_unique_trivial_non_capturing_lambdas +=
           that.kotlin_unique_trivial_non_capturing_lambdas;
+      atomic_field_updater_newupdater_insns +=
+          that.atomic_field_updater_newupdater_insns;
+      atomic_field_updater_op_insns += that.atomic_field_updater_op_insns;
+      for (size_t i = 0; i < kotlin_invoke_interface_function_insns.size();
+           ++i) {
+        kotlin_invoke_interface_function_insns[i] +=
+            that.kotlin_invoke_interface_function_insns[i];
+      }
+      kotlin_lambda_type_method_params += that.kotlin_lambda_type_method_params;
       return *this;
     }
 
@@ -153,8 +187,18 @@ class PrintKotlinStats : public Pass {
   UnorderedSet<DexMethodRef*> m_kotlin_expr_null_assertions;
   UnorderedSet<DexMethodRef*> m_kotlin_notnull_assertions;
   DexMethodRef* m_kotlin_areequal = nullptr;
+  DexMethodRef* m_kotlin_compare_int = nullptr;
+  DexMethodRef* m_kotlin_compare_long = nullptr;
   DexType* m_kotlin_lambdas_base = nullptr;
   DexType* m_kotlin_coroutin_continuation_base = nullptr;
   const DexString* m_instance = nullptr;
+  // `kotlin.jvm.functions.Function<i>.invoke` refs for arities 0..22, plus
+  // `FunctionN.invoke(Object[])` for arities >= 23 at index 23. Entries are
+  // null when the corresponding ref is absent from the program.
+  std::array<DexMethodRef*, 24> m_kotlin_function_invokes{};
+  // The Atomic{Reference,Integer,Long}FieldUpdater types present in the
+  // program.
+  UnorderedSet<const DexType*> m_atomic_field_updaters;
+  const DexString* m_new_updater = nullptr;
   Stats m_stats;
 };

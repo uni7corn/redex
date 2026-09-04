@@ -128,9 +128,6 @@ struct RedexContext {
    */
   void alias_method_name(DexMethodRef* method, const DexString* new_name);
 
-  DexMethodHandle* make_methodhandle();
-  DexMethodHandle* get_methodhandle();
-
   void erase_method(DexMethodRef*);
   void erase_method(const DexType* type,
                     const DexString* name,
@@ -161,6 +158,14 @@ struct RedexContext {
   bool class_already_loaded(DexClass* cls);
 
   void publish_class(DexClass* cls);
+
+  // Call sites and method handles are created by the dex loader (DexIdx) and
+  // referenced by non-owning raw pointers throughout the IR; they are not
+  // interned by value. RedexContext takes ownership of each (as publish_class
+  // does for classes) so it can be freed at teardown. Thread-safe: called from
+  // the parallel dex-load path.
+  void publish_callsite(DexCallSite* callsite);
+  void publish_methodhandle(DexMethodHandle* methodhandle);
 
   DexClass* type_class(const DexType* t) const;
   DexType* class_type(const DexClass* cls) const;
@@ -225,6 +230,29 @@ struct RedexContext {
   bool instrument_mode{false};
   bool slow_invariants_debug{false};
   bool disable_violation_fixes{false};
+
+  // Off by default while the corrected behaviour is being measured; a
+  // supported flag for as long as both behaviours need to coexist.
+  // When set, transforms preserve the INTEGRITY of SourceBlock execution
+  // counts rather than treating `val` as 0/1 coverage: a duplicated block has
+  // its count apportioned across the copies instead of copied verbatim, a
+  // block that loses a predecessor sheds the inflow that departed instead of
+  // being clamped to the MAX over the survivors, and a synthesized callsite
+  // takes its count from the profile instead of a literal. All three are
+  // correct for coverage and wrong once vals carry counts.
+  //
+  // Named to pair with `run_count_integrity_after_each_pass`, which checks the
+  // same invariant this maintains.
+  //
+  // Global rather than per-pass, following disable_violation_fixes above,
+  // because the affected code is shared services with several owners:
+  // constant propagation runs in ConstantPropagationPass,
+  // InterproceduralConstantPropagationPass AND the inliner's shrinker, and
+  // SwitchEquivFinder has no owning pass at all. A per-pass knob could also be
+  // left half-set by a local `-J` arm override, silently measuring a
+  // partially-corrected state.
+  bool preserve_count_integrity{false};
+  bool insert_remarks{false};
 
   bool ordering_changes_allowed() const { return m_ordering_changes_allowed; }
   void set_ordering_changes_allowed(bool new_val) {
@@ -496,6 +524,11 @@ struct RedexContext {
   InsertOnlyConcurrentSet<DexClass*> m_classes;
   std::mutex m_external_classes_mutex;
   std::vector<DexClass*> m_external_classes;
+
+  // DexCallSite / DexMethodHandle, owned (not interned) so teardown can free
+  // them; see publish_callsite/publish_methodhandle.
+  InsertOnlyConcurrentSet<DexCallSite*> m_callsites;
+  InsertOnlyConcurrentSet<DexMethodHandle*> m_methodhandles;
 
   const std::vector<const DexType*> m_empty_types;
 

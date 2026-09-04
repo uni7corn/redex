@@ -6,8 +6,11 @@
  */
 
 #include "PrintKotlinStats.h"
+
+#include "AtomicFieldUpdaters.h"
 #include "ConfigFiles.h"
 #include "ControlFlow.h"
+#include "Debug.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "KotlinLambdaAnalyzer.h"
@@ -15,7 +18,9 @@
 #include "MethodProfiles.h"
 #include "MethodUtil.h"
 #include "PassManager.h"
+#include "ReachableClasses.h"
 #include "Trace.h"
+#include "TypeUtil.h"
 #include "UniqueMethodTracker.h"
 #include "Walkers.h"
 
@@ -139,9 +144,27 @@ void PrintKotlinStats::setup() {
   kotlin_nullcheck_wrapper::get_kotlin_notnull_assertions(
       m_kotlin_notnull_assertions);
   m_kotlin_areequal = method::kotlin_jvm_internal_Intrinsics_areEqual();
+  m_kotlin_compare_int =
+      DexMethod::get_method("Lkotlin/jvm/internal/Intrinsics;.compare:(II)I");
+  m_kotlin_compare_long =
+      DexMethod::get_method("Lkotlin/jvm/internal/Intrinsics;.compare:(JJ)I");
   m_kotlin_lambdas_base = DexType::get_type(KOTLIN_LAMBDA);
   m_kotlin_coroutin_continuation_base = DexType::get_type(CONTINUATION_IMPL);
   m_instance = DexString::make_string("INSTANCE");
+  // Build descriptors for kotlin.jvm.functions.Function<i>.invoke at arities
+  // 0-22, plus the vararg FunctionN.invoke(Object[]) for arities >= 23.
+  std::string args;
+  for (size_t i = 0; i < 23; ++i) {
+    std::string desc = "Lkotlin/jvm/functions/Function" + std::to_string(i) +
+                       ";.invoke:(" + args + ")Ljava/lang/Object;";
+    m_kotlin_function_invokes[i] = DexMethod::get_method(desc);
+    args += "Ljava/lang/Object;";
+  }
+  m_kotlin_function_invokes[23] = DexMethod::get_method(
+      "Lkotlin/jvm/functions/FunctionN;"
+      ".invoke:([Ljava/lang/Object;)Ljava/lang/Object;");
+  m_atomic_field_updaters = atomic_field_updaters::present_types();
+  m_new_updater = atomic_field_updaters::new_updater_name();
 }
 
 // Annotate Kotlin classes before StripDebugInfoPass removes it
@@ -363,8 +386,16 @@ PrintKotlinStats::Stats PrintKotlinStats::handle_method(DexMethod* method) {
     }
   }
 
+  // Count method parameters that are Kotlin lambda types.
+  const auto* param_types = method->get_proto()->get_args();
+  stats.kotlin_lambda_type_method_params +=
+      std::count_if(param_types->begin(), param_types->end(),
+                    type::is_kotlin_function_interface);
+
   always_assert(method->get_code()->cfg_built());
   auto& cfg = method->get_code()->cfg();
+
+  const bool method_is_root = root(method);
 
   for (const auto& it : cfg::InstructionIterable(cfg)) {
     auto* insn = it.insn;
@@ -372,7 +403,11 @@ PrintKotlinStats::Stats PrintKotlinStats::handle_method(DexMethod* method) {
     case OPCODE_INVOKE_STATIC: {
       auto* called_method = insn->get_method();
       if (m_kotlin_param_null_assertions.count(called_method) != 0u) {
-        stats.kotlin_null_check_param_insns++;
+        if (method_is_root) {
+          stats.kotlin_null_check_param_insns_in_root_method++;
+        } else {
+          stats.kotlin_null_check_param_insns_in_non_root_method++;
+        }
       } else if (m_kotlin_expr_null_assertions.count(called_method) != 0u) {
         stats.kotlin_null_check_expr_insns++;
       } else if (m_kotlin_notnull_assertions.count(called_method) != 0u) {
@@ -380,6 +415,19 @@ PrintKotlinStats::Stats PrintKotlinStats::handle_method(DexMethod* method) {
       }
       if (m_kotlin_areequal != nullptr && called_method == m_kotlin_areequal) {
         stats.kotlin_areequal_insns++;
+      }
+      if (m_kotlin_compare_int != nullptr &&
+          called_method == m_kotlin_compare_int) {
+        stats.kotlin_compare_int_insns++;
+      }
+      if (m_kotlin_compare_long != nullptr &&
+          called_method == m_kotlin_compare_long) {
+        stats.kotlin_compare_long_insns++;
+      }
+      if (m_new_updater != nullptr &&
+          called_method->get_name() == m_new_updater &&
+          m_atomic_field_updaters.count(called_method->get_class()) != 0u) {
+        stats.atomic_field_updater_newupdater_insns++;
       }
     } break;
     case OPCODE_AND_INT_LIT: {
@@ -391,6 +439,23 @@ PrintKotlinStats::Stats PrintKotlinStats::handle_method(DexMethod* method) {
       }
       stats.kotlin_and_lit_insns++;
     } break;
+    case OPCODE_INVOKE_INTERFACE: {
+      auto* called_method = insn->get_method();
+      for (size_t i = 0; i < m_kotlin_function_invokes.size(); ++i) {
+        if (m_kotlin_function_invokes[i] != nullptr &&
+            called_method == m_kotlin_function_invokes[i]) {
+          stats
+              .kotlin_invoke_interface_function_insns[std::min(i, size_t{4})]++;
+          break;
+        }
+      }
+    } break;
+    case OPCODE_INVOKE_VIRTUAL: {
+      if (m_atomic_field_updaters.count(insn->get_method()->get_class()) !=
+          0u) {
+        stats.atomic_field_updater_op_insns++;
+      }
+    } break;
     default:
       break;
     }
@@ -399,12 +464,16 @@ PrintKotlinStats::Stats PrintKotlinStats::handle_method(DexMethod* method) {
 }
 
 void PrintKotlinStats::Stats::report(PassManager& mgr) const {
-  mgr.incr_metric("kotlin_null_check_param_insns",
-                  kotlin_null_check_param_insns);
+  mgr.incr_metric("kotlin_null_check_param_insns_in_root_method",
+                  kotlin_null_check_param_insns_in_root_method);
+  mgr.incr_metric("kotlin_null_check_param_insns_in_non_root_method",
+                  kotlin_null_check_param_insns_in_non_root_method);
   mgr.incr_metric("kotlin_null_check_expr_insns", kotlin_null_check_expr_insns);
   mgr.incr_metric("kotlin_null_check_notnull_insns",
                   kotlin_null_check_notnull_insns);
   mgr.incr_metric("kotlin_areequal_insns", kotlin_areequal_insns);
+  mgr.incr_metric("kotlin_compare_int_insns", kotlin_compare_int_insns);
+  mgr.incr_metric("kotlin_compare_long_insns", kotlin_compare_long_insns);
   mgr.incr_metric("kotlin_default_arg_check_insns",
                   kotlin_default_arg_check_insns);
   mgr.incr_metric("kotlin_default_arg_1_param", kotlin_default_arg_1_param);
@@ -457,15 +526,42 @@ void PrintKotlinStats::Stats::report(PassManager& mgr) const {
                   kotlin_trivial_non_capturing_lambdas);
   mgr.incr_metric("kotlin_unique_trivial_non_capturing_lambdas",
                   kotlin_unique_trivial_non_capturing_lambdas);
+  mgr.incr_metric("atomic_field_updater_newupdater_insns",
+                  atomic_field_updater_newupdater_insns);
+  mgr.incr_metric("atomic_field_updater_op_insns",
+                  atomic_field_updater_op_insns);
+  TRACE(KOTLIN_STATS, 1,
+        "KOTLIN_STATS: atomic_field_updater newUpdater=%zu op=%zu",
+        atomic_field_updater_newupdater_insns, atomic_field_updater_op_insns);
+  for (size_t i = 0; i < kotlin_invoke_interface_function_insns.size(); ++i) {
+    std::string name = "kotlin_invoke_interface_function" +
+                       (i < 4 ? std::to_string(i) : std::string("4plus")) +
+                       "_insns";
+    mgr.incr_metric(name, kotlin_invoke_interface_function_insns[i]);
+    TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: %s = %zu", name.c_str(),
+          kotlin_invoke_interface_function_insns[i]);
+  }
+  mgr.incr_metric("kotlin_lambda_type_method_params",
+                  kotlin_lambda_type_method_params);
+  TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_lambda_type_method_params = %zu",
+        kotlin_lambda_type_method_params);
 
-  TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_null_check_param_insns = %zu",
-        kotlin_null_check_param_insns);
+  TRACE(KOTLIN_STATS, 1,
+        "KOTLIN_STATS: kotlin_null_check_param_insns_in_root_method = %zu",
+        kotlin_null_check_param_insns_in_root_method);
+  TRACE(KOTLIN_STATS, 1,
+        "KOTLIN_STATS: kotlin_null_check_param_insns_in_non_root_method = %zu",
+        kotlin_null_check_param_insns_in_non_root_method);
   TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_null_check_expr_insns = %zu",
         kotlin_null_check_expr_insns);
   TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_null_check_notnull_insns = %zu",
         kotlin_null_check_notnull_insns);
   TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_areequal_insns = %zu",
         kotlin_areequal_insns);
+  TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_compare_int_insns = %zu",
+        kotlin_compare_int_insns);
+  TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_compare_long_insns = %zu",
+        kotlin_compare_long_insns);
   TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_hot_default_arg_1_param = %zu",
         kotlin_hot_default_arg_1_param);
   TRACE(KOTLIN_STATS, 1, "KOTLIN_STATS: kotlin_hot_default_arg_2_params = %zu",
